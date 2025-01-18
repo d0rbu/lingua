@@ -1,5 +1,9 @@
 # Meta Lingua
 
+## DISCLAIMER ABOUT THIS FORK
+
+I only focused on using apps/main and thus removed the other apps. If you find yourself needing those then add them back yourself or use the original meta/lingua.
+
 **Mathurin Videau***, **Badr Youbi Idrissi***, Daniel Haziza, Luca Wehrstedt, Jade Copet, Olivier Teytaud, David Lopez-Paz. ***Equal and main contribution**
 
 Meta Lingua is a minimal and fast LLM training and inference library designed for research. Meta Lingua uses easy-to-modify PyTorch components in order to try new architectures, losses, data, etc. We aim for this code to enable end to end training, inference and evaluation as well as provide tools to better understand speed and stability. While Meta Lingua is currently under development, we provide you with multiple `apps` to showcase how to use this codebase.
