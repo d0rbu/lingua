@@ -4,7 +4,8 @@ import abc
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Self
+from enum import Enum
 import logging
 import os
 
@@ -18,22 +19,26 @@ logger = logging.getLogger(__name__)
 @dataclass
 class TokenizerArgs:
     name: str = "bytes"
-    path: Optional[str] = None
+    path: str | None = None
 
 
 class Tokenizer(abc.ABC):
     @abc.abstractmethod
-    def encode(self, tokens, add_bos, add_eos):
+    def __init__(self: Self, model_path: str) -> None:
         pass
 
     @abc.abstractmethod
-    def decode(self, tokens):
+    def encode(self: Self, text: str, add_bos: bool, add_eos: bool) -> list[int]:
+        pass
+
+    @abc.abstractmethod
+    def decode(self: Self, tokens: list[int]) -> str:
         pass
 
     @abc.abstractmethod
     def get_token_offsets(
-        self, text: str, tokens: Optional[List[int]] = None
-    ) -> Tuple[List[str], List[int]]:
+        self: Self, text: str, tokens: list[int] | None = None
+    ) -> tuple[list[str], list[int]]:
         """Return the offsets of the tokens in the original text. Only used for evaluation."""
         pass
 
@@ -41,27 +46,32 @@ class Tokenizer(abc.ABC):
 class MockTokenizer(Tokenizer):
     n_words: int = 256
 
-    def encode(self, tokens, add_bos, add_eos):
+    def __init__(self: Self, model_path: str) -> None:
+        pass
+
+    def encode(self: Self, tokens: list[int], add_bos: bool, add_eos: bool) -> list[int]:
         return tokens
 
 
 class ByteTokenizer(Tokenizer):
-    def __init__(self):
+    def __init__(self: Self, model_path: str) -> None:
         self.bos_id = 256
         self.eos_id = 257
         self.n_words = 258
 
-    def encode(self, s: str, add_bos: bool = False, add_eos: bool = False):
-        tokens = [self.bos_id] * add_bos + list(s.encode()) + [self.eos_id] * add_eos
+    def encode(self: Self, text: str, add_bos: bool = False, add_eos: bool = False):
+        tokens = [self.bos_id] * add_bos + list(text.encode()) + [self.eos_id] * add_eos
+
         return tokens
 
-    def decode(self, tokens: List[int]):
+    def decode(self, tokens: list[int]):
         byte_tokens = bytes([t for t in tokens if t < 256])
+
         return byte_tokens.decode("utf-8", errors="backslashreplace")
 
     def get_token_offsets(
-        self, text: str, tokens: Optional[List[int]] = None
-    ) -> Tuple[List[str], List[int]]:
+        self, text: str, tokens: list[int] | None = None
+    ) -> tuple[list[str], list[int]]:
         if tokens is None:
             tokens = self.encode(text)
 
@@ -79,7 +89,7 @@ class ByteTokenizer(Tokenizer):
 
 
 class SentencePieceTokenizer(Tokenizer):
-    def __init__(self, model_path: str) -> None:
+    def __init__(self: Self, model_path: str) -> None:
         assert os.path.isfile(model_path), model_path
         self.sp_model = SentencePieceProcessor(model_file=model_path)
 
@@ -93,24 +103,27 @@ class SentencePieceTokenizer(Tokenizer):
         logger.info(
             f"#words: {self.n_words} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id}"
         )
+
         assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
 
-    def encode(self, s: str, add_bos: bool, add_eos: bool):
-        assert type(s) is str
+    def encode(self: Self, text: str, add_bos: bool, add_eos: bool) -> list[int]:
+        assert isinstance(text, str)
         tokens = (
-            [self.bos_id] * add_bos + self.sp_model.encode(s) + [self.eos_id] * add_eos
+            [self.bos_id] * add_bos + self.sp_model.encode(text) + [self.eos_id] * add_eos
         )
+
         return tokens
 
-    def decode(self, tokens: List[int]):
+    def decode(self, tokens: list[int]):
         return self.sp_model.decode(tokens)
 
     def get_token_offsets(
-        self, text: str, tokens: Optional[List[int]] = None
-    ) -> Tuple[List[str], List[int]]:
+        self, text: str, tokens: list[int] | None = None
+    ) -> tuple[list[str], list[int]]:
         pieces = self.sp_model.encode_as_immutable_proto(text).pieces
         substrs = [p.surface for p in pieces]
         offsets = [p.begin for p in pieces]
+
         return substrs, offsets
 
 
@@ -128,8 +141,7 @@ TIKTOKEN_MAX_ENCODE_CHARS = 400_000
 
 
 class TikTokenTokenizer(Tokenizer):
-
-    def __init__(self, model_path: str) -> None:
+    def __init__(self: Self, model_path: str) -> None:
         mergeable_ranks = load_tiktoken_bpe(model_path)
         all_special_tokens_with_ids = copy(DEFAULT_TIKTOKEN_SPECIAL_TOKENS)
         missing_ids = set(range(256)) - set(all_special_tokens_with_ids.values())
@@ -154,24 +166,24 @@ class TikTokenTokenizer(Tokenizer):
             f"#words: {self.n_words} - BOS ID: {self.bos_id} - EOS ID: {self.eos_id}"
         )
 
-    def encode(self, s: str, add_bos: bool, add_eos: bool):
-        assert isinstance(s, str)
+    def encode(self: Self, text: str, add_bos: bool, add_eos: bool):
+        assert isinstance(text, str)
 
         subs = []
-        for i in range(0, len(s), TIKTOKEN_MAX_ENCODE_CHARS):
-            subs.append(s[i : i + TIKTOKEN_MAX_ENCODE_CHARS])
+        for i in range(0, len(text), TIKTOKEN_MAX_ENCODE_CHARS):
+            subs.append(text[i : i + TIKTOKEN_MAX_ENCODE_CHARS])
         return (
             [self.bos_id] * add_bos
             + sum(self.tkt_model.encode_ordinary_batch(subs), start=[])
             + [self.eos_id] * add_eos
         )
 
-    def decode(self, tokens: List[int]):
+    def decode(self, tokens: list[int]):
         return self.tkt_model.decode(tokens)
 
     def get_token_offsets(
-        self, text: str, tokens: Optional[List[int]] = None
-    ) -> Tuple[List[str], List[int]]:
+        self, text: str, tokens: list[int] | None = None
+    ) -> tuple[list[str], list[int]]:
         if tokens is not None:
             token_bytes = self.tkt_model.decode_tokens_bytes(tokens)
         else:
@@ -184,17 +196,29 @@ class TikTokenTokenizer(Tokenizer):
             offsets.append(max(0, text_len - (0x80 <= token[0] < 0xC0)))
             text_len += sum(1 for c in token if not 0x80 <= c < 0xC0)
         substrs = [text[s:e] for s, e in zip(offsets, offsets[1:] + [None])]
+
         return substrs, offsets
 
 
-def build_tokenizer(name: str, path: Optional[str] = None) -> Tokenizer:
-    if name == "bytes":
-        return ByteTokenizer()
-    elif name == "mock":
-        return MockTokenizer()
-    elif name == "sp":
-        return SentencePieceTokenizer(path)
-    elif name == "tiktoken":
-        return TikTokenTokenizer(path)
-    else:
-        raise NotImplementedError(f"{name} tokenizer type is not implemented")
+class TokenizerType(Enum):
+    BYTES = "bytes"
+    MOCK = "mock"
+    SP = "sp"
+    TIKTOKEN = "tiktoken"
+
+
+tokenizer_classes = {
+    TokenizerType.BYTES: ByteTokenizer,
+    TokenizerType.MOCK: MockTokenizer,
+    TokenizerType.SP: SentencePieceTokenizer,
+    TokenizerType.TIKTOKEN: TikTokenTokenizer,
+}
+
+
+def build_tokenizer(type: TokenizerType, path: str | None = None) -> Tokenizer:
+    tokenizer_class = tokenizer_classes.get(TokenizerType(type), None)
+
+    if tokenizer_class is None:
+        raise NotImplementedError(f"{type} tokenizer type is not implemented")
+
+    return tokenizer_class(path)

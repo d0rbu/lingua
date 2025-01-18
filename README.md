@@ -185,7 +185,7 @@ So if the dataclass looks like
 @dataclass
 class DummyArgs:
     name: str = "blipbloup"
-    mode: LMTransformerArgs = LMTransformerArgs()
+    model: LMTransformerArgs = LMTransformerArgs()
     
 @dataclass
 class LMTransformerArgs:

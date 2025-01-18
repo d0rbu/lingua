@@ -179,7 +179,7 @@ def get_world_size() -> int:
 
 
 @lru_cache()
-def get_is_master() -> bool:
+def is_master() -> bool:
     return get_global_rank() == 0
 
 
@@ -346,7 +346,7 @@ def init_signal_handler(callable):
     logger.warning("Signal handler installed.")
 
 
-def requeue_slurm_job():
+def requeue_slurm_job() -> None:
     prod_id = int(os.environ["SLURM_PROCID"])
     logger.warning("Host: %s - Global rank: %i" % (socket.gethostname(), prod_id))
     if prod_id == 0 and os.environ.get("LAUNCH_WITH", "") != "DORA":
@@ -398,7 +398,7 @@ def parallelize_model(
         ), "Only full shard is supported for TP parallelism"
         assert tp_parallelize is not None, "TP plan is required for TP parallelism"
         assert (
-            distributed_args.compile == False
+            not distributed_args.compile
         ), "Compile is not supported for TP parallelism"
 
         tp_parallelize(model, device_mesh["tp"], model_args, distributed_args)

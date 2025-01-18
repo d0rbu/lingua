@@ -1,18 +1,19 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 from dataclasses import dataclass
+from functools import partial
 from enum import Enum
-from typing import Optional, Union, Tuple
+from typing import Self
 
 import torch
 from torch import nn
 from torch.nn import functional as F
-from xformers.ops import fmha, AttentionBias
 from torch.nn.attention.flex_attention import (
     BlockMask,
-    flex_attention,
     _mask_mod_signature,
+    flex_attention,
 )
+from xformers.ops import AttentionBias, fmha
 
 from lingua import probe
 
@@ -26,15 +27,21 @@ class InitStdFactor(Enum):
     DIM_RATIO = "dim_ratio"  # Init std is divided by model_dim/4096
 
 
+class AttentionImpl(Enum):
+    SDPA = "sdpa"
+    FMHA = "fmha"
+    FLEX_ATTENTION = "flex_attention"
+    XFORMERS = "xformers"
+
+
 @dataclass
 class BaseTransformerArgs:
     dim: int = 512
     n_layers: int = 8
-    head_dim: Optional[int] = None
-    n_heads: Optional[int] = None
-    n_kv_heads: Optional[int] = None
-
-    ffn_dim_multiplier: Optional[float] = None
+    hidden_dim: int | None = None  # by default hidden_dim = 4 * dim * 2/3 because 4x usual expansion and 2/3 to adjust for gate projection
+    head_dim: int | None = None
+    n_heads: int | None = None
+    n_kv_heads: int | None = None
 
     multiple_of: int = 256
 
@@ -42,13 +49,13 @@ class BaseTransformerArgs:
 
     rope_theta: float = 10000.0
 
-    init_base_std: Optional[float] = None
-    init_std_factor: str = "disabled"
+    init_base_std: float | None = None
+    init_std_factor: InitStdFactor = InitStdFactor.DISABLED
 
     max_seqlen: int = 1024
 
 
-def cross_entropy(pred, target, **kwargs):
+def cross_entropy(pred: torch.Tensor, target: torch.Tensor, **kwargs) -> torch.Tensor:
     return F.nll_loss(
         F.log_softmax(pred.flatten(end_dim=-2).float(), -1),
         target.flatten(end_dim=-1),
@@ -56,103 +63,22 @@ def cross_entropy(pred, target, **kwargs):
     )
 
 
-def repeat_kv(x: torch.Tensor, n_rep: int, dim: int) -> torch.Tensor:
-    """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
-    assert dim == 2, "Only dim=2 is supported. Check the implementation for other dims."
-    bs, slen, n_kv_heads, head_dim = x.shape
-    if n_rep == 1:
-        return x
-    return (
-        x[:, :, :, None, :]
-        .expand(bs, slen, n_kv_heads, n_rep, head_dim)
-        .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
-    )
-
-
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
-    """
-    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
-
-    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
-    and the end index 'end'. The 'theta' parameter scales the frequencies.
-    The returned tensor contains complex values in complex64 data type.
-
-    Args:
-        dim (int): Dimension of the frequency tensor.
-        end (int): End index for precomputing frequencies.
-        theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
-
-    Returns:
-        torch.Tensor: Precomputed frequency tensor with complex exponentials.
-    """
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-    t = torch.arange(end, device=freqs.device)
-    freqs = torch.outer(t, freqs).float()
-
-    cos, sin = freqs.cos(), freqs.sin()
-
-    return torch.stack((cos, -sin, sin, cos), dim=-1).view(*freqs.size(), 2, 2)
-
-
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor, seq_dim: int):
-    """
-    Reshape frequency tensor for broadcasting it with another tensor.
-
-    This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
-    for the purpose of broadcasting the frequency tensor during element-wise operations.
-
-    Args:
-        freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
-        x (torch.Tensor): Target tensor for broadcasting compatibility.
-        seq_dim (int): Sequence dimension index.
-
-    Returns:
-        torch.Tensor: Reshaped frequency tensor.
-    """
-    ndim = x.ndim
-    assert 0 <= seq_dim < ndim
-    assert freqs_cis.shape == (
-        x.shape[seq_dim],
-        x.shape[-3],
-        2,
-        2,
-    ), f"freqs_cis vs x: {(freqs_cis.shape, x.shape)}"
-    shape = [
-        d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-2])
-    ] + [2, 2]
-    return freqs_cis.view(*shape)
-
-
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    seq_dim: int,
-    freqs_cis: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    xq_ = xq.reshape(*xq.shape[:-1], -1, 1, 2)  # B S H D -> B S H D/2 1 2
-    xk_ = xk.reshape(*xk.shape[:-1], -1, 1, 2)  # B S H D -> B S H D/2 1 2
-    freqs_cis = reshape_for_broadcast(
-        freqs_cis, xq_, seq_dim
-    ).float()  # S D/2 2 2 -> 1 S 1 D/2 2 2
-    xq_out = (xq_ * freqs_cis).sum(5).flatten(3)
-    xk_out = (xk_ * freqs_cis).sum(5).flatten(3)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
-
-
-def causal_mask(b, h, q_idx, kv_idx):
+def causal_mask(
+    b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+) -> torch.Tensor:
     return q_idx >= kv_idx
 
 
-def lengths_to_start_ids(lengths):
+def lengths_to_start_ids(lengths: torch.Tensor) -> torch.Tensor:
     doc_start = lengths.cumsum(0)
     doc_start = doc_start.roll(1)
     doc_start[0] = 0
     return doc_start
 
 
-def lengths_to_local_ids(lengths):
+def lengths_to_local_ids(lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     assert lengths.ndim == 1
-    nb_seqs = lengths.size(0)
+
     total_seqlen = lengths.sum()
     # This gives the document id of each token
     doc_id = torch.repeat_interleave(lengths)
@@ -169,7 +95,7 @@ def lengths_to_local_ids(lengths):
 def generate_doc_mask_mod(
     mask_mod: _mask_mod_signature,
     lengths: torch.Tensor,
-    kv_lengths: Optional[torch.Tensor] = None,
+    kv_lengths: torch.Tensor | None = None,
 ) -> _mask_mod_signature:
     """Generates mask mods that apply to inputs to flex attention in the sequence stacked
     format.
@@ -204,7 +130,9 @@ def generate_doc_mask_mod(
     q_max_idx = lengths.sum() - 1
     kv_max_idx = kv_lengths.sum() - 1
 
-    def doc_mask_mod(b, h, q_idx, kv_idx):
+    def doc_mask_mod(
+        b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+    ) -> torch.Tensor:
         q_idx_cap = torch.minimum(q_max_idx, q_idx)
         kv_idx_cap = torch.minimum(kv_max_idx, kv_idx)
         valid_idx = (q_idx <= q_max_idx) & (kv_idx <= kv_max_idx)
@@ -223,7 +151,9 @@ class RotaryEmbedding(torch.nn.Module):
     RotaryEmbedding Module
     """
 
-    def __init__(self, theta: float, head_dim: int, max_seqlen: int = 1024):
+    def __init__(
+        self: Self, theta: float, head_dim: int, max_seqlen: int = 1024
+    ) -> None:
         super().__init__()
 
         self.theta = theta
@@ -232,18 +162,18 @@ class RotaryEmbedding(torch.nn.Module):
 
         self.register_buffer(
             "freqs_cis",
-            precompute_freqs_cis(dim=head_dim, end=max_seqlen, theta=theta),
+            self.precompute_freqs_cis(dim=head_dim, end=max_seqlen, theta=theta),
             persistent=False,
         )
 
-    def reset_parameters(self):
-        self.freqs_cis[...] = precompute_freqs_cis(
+    def reset_parameters(self: Self) -> None:
+        self.freqs_cis[...] = self.precompute_freqs_cis(
             dim=self.head_dim, end=self.max_seqlen, theta=self.theta
         )
 
     def forward(
-        self, seqlen: Optional[int] = None, tok_idx: Optional[torch.Tensor] = None
-    ):
+        self: Self, seqlen: int | None = None, tok_idx: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Return freqs_cis corresponding to consecutive seqlen positions or the corresponding tok_idx positions
         Args:
@@ -260,6 +190,31 @@ class RotaryEmbedding(torch.nn.Module):
         elif seqlen is not None:
             return self.freqs_cis[0:seqlen]
 
+    @staticmethod
+    def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+        """
+        Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+        This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
+        and the end index 'end'. The 'theta' parameter scales the frequencies.
+        The returned tensor contains complex values in complex64 data type.
+
+        Args:
+            dim (int): Dimension of the frequency tensor.
+            end (int): End index for precomputing frequencies.
+            theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+
+        Returns:
+            torch.Tensor: Precomputed frequency tensor with complex exponentials.
+        """
+        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+        t = torch.arange(end, device=freqs.device)
+        freqs = torch.outer(t, freqs).float()
+
+        cos, sin = freqs.cos(), freqs.sin()
+
+        return torch.stack((cos, -sin, sin, cos), dim=-1).view(*freqs.size(), 2, 2)
+
 
 class RMSNorm(nn.Module):
     """
@@ -275,32 +230,32 @@ class RMSNorm(nn.Module):
 
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self: Self, dim: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x: torch.Tensor):
+    def _norm(self: Self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.rsqrt((x * x).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
         x = probe.log_stats(x, "resid")
         output = self._norm(x.float())
         return (output * self.weight.float()).type_as(x)
 
-    def reset_parameters(self):
+    def reset_parameters(self: Self) -> None:
         torch.nn.init.ones_(self.weight)  # type: ignore
 
 
 class Attention(nn.Module):
     def __init__(
-        self,
+        self: Self,
         dim: int,
         head_dim: int,
         n_heads: int,
         n_kv_heads: int,
         rope_theta: float,
-    ):
+    ) -> None:
         super().__init__()
 
         self.dim = dim
@@ -311,97 +266,133 @@ class Attention(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.heads_per_group = self.n_heads // self.n_kv_heads
 
-        self.wq = nn.Linear(
+        self.q_proj = nn.Linear(
             dim,
             n_heads * head_dim,
             bias=False,
         )
-        self.wk = nn.Linear(
+        self.k_proj = nn.Linear(
             dim,
             n_kv_heads * head_dim,
             bias=False,
         )
-        self.wv = nn.Linear(
+        self.v_proj = nn.Linear(
             dim,
             n_kv_heads * head_dim,
             bias=False,
         )
 
-        self.wo = nn.Linear(
+        self.o_proj = nn.Linear(
             n_heads * head_dim,
             dim,
             bias=False,
         )
+    
+    @staticmethod
+    def __flex_attention(
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        block_mask: BlockMask | None = None,
+    ) -> torch.Tensor:
+        assert block_mask is None or isinstance(block_mask, BlockMask)
+
+        queries, keys, values = queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
+        output = flex_attention_comp(queries, keys, values, block_mask=block_mask)
+        output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+
+        return output
+
+    @staticmethod
+    def __fmha(
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        attn_bias: AttentionBias | None = None,
+    ) -> torch.Tensor:
+        assert attn_bias is None or isinstance(attn_bias, AttentionBias)
+
+        return fmha.memory_efficient_attention(queries, keys, values, attn_bias=attn_bias)
+        # This uses B S H D instead of B H S D of pytorch
+
+    @staticmethod
+    def __sdpa(
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        mask: str | torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert mask is None or isinstance(mask, (str, torch.Tensor))
+
+        queries, keys, values = queries.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
+        is_causal = isinstance(mask, str) and mask == "causal"
+        mask = None if isinstance(mask, str) else mask
+        output = F.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            is_causal=is_causal,
+            attn_mask=mask,
+        )
+        output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+
+        return output
+
+    ATTN_IMPLS = {
+        AttentionImpl.SDPA: __sdpa,
+        AttentionImpl.FMHA: __fmha,
+        AttentionImpl.FLEX_ATTENTION: __flex_attention,
+    }
 
     def forward(
-        self,
+        self: Self,
         x: torch.Tensor,
         freq_cis: torch.Tensor,
-        tok_idx: Optional[torch.Tensor] = None,
-        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
-        attn_impl: str = "sdpa",
+        tok_idx: torch.Tensor | None = None,
+        mask: BlockMask | AttentionBias | str | None = None,
+        attn_impl: AttentionImpl = AttentionImpl.SDPA,
     ) -> torch.Tensor:
         # B S D
-        bsz, seq_len, dim = x.shape
-        xq = self.wq(x.view_as(x))
-        xk = self.wk(x.view_as(x))
-        xv = self.wv(x.view_as(x))
+        bsz, seq_len, _ = x.shape
+        queries = self.q_proj(x.view_as(x))
+        keys = self.k_proj(x.view_as(x))
+        values = self.v_proj(x.view_as(x))
 
-        output_shape = xq.shape
+        output_shape = queries.shape
         # B S D -> B S H D
-        xq = xq.view(bsz, seq_len, self.n_heads, self.head_dim)
-        xk = xk.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+        queries = queries.view(bsz, seq_len, self.n_heads, self.head_dim)
+        keys = keys.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
+        values = values.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis[0:seq_len])
+        queries, keys = self.apply_rotary_emb(queries, keys, 1, freq_cis[0:seq_len])
 
         # This condition helps us be easily compatible
         # with inference by adding a pluggable KVCache
         if hasattr(self, "kv_cache"):
-            xk, xv = self.kv_cache.update(xk, xv, tok_idx)
+            keys, values = self.kv_cache.update(keys, values, tok_idx)
 
-        xk = repeat_kv(xk, self.heads_per_group, dim=2)
-        xv = repeat_kv(xv, self.heads_per_group, dim=2)
+        keys = self.repeat_kv(keys, self.heads_per_group, dim=2)
+        values = self.repeat_kv(values, self.heads_per_group, dim=2)
 
-        if attn_impl == "flex_attention":
-            assert mask is None or isinstance(mask, BlockMask)
-            xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
-            output = flex_attention_comp(xq, xk, xv, block_mask=mask)
-            output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+        attn_impl = self.ATTN_IMPLS.get(attn_impl, None)
 
-        elif attn_impl == "fmha":
-            assert mask is None or isinstance(mask, AttentionBias)
-            output = fmha.memory_efficient_attention(xq, xk, xv, attn_bias=mask)
-            # This uses B S H D instead of B H S D of pytorch
-
-        elif attn_impl == "sdpa":
-            xq, xk, xv = map(lambda e: e.transpose(1, 2), (xq, xk, xv))
-            assert mask is None or isinstance(mask, (str, torch.Tensor))
-            is_causal = (mask == "causal") if isinstance(mask, str) else False
-            mask = mask if isinstance(mask, torch.Tensor) else None
-            output = F.scaled_dot_product_attention(
-                xq,
-                xk,
-                xv,
-                is_causal=is_causal,
-                attn_mask=mask,
-            )
-            output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
-        else:
+        if attn_impl is None:
             raise NotImplementedError(
                 f"Attention implementation {attn_impl} not supported"
             )
 
-        output = self.wo(output.reshape(output_shape))
+        output = attn_impl(queries, keys, values, mask)
+
+        output = self.o_proj(output.reshape(output_shape))
 
         return output
 
-    def reset_parameters(self, init_std=None, factor=1.0):
+    def reset_parameters(self: Self, init_std=None, factor=1.0) -> None:
         init_std = init_std or (self.dim ** (-0.5))
 
-        for w in [self.wq, self.wk, self.wv]:
+        for linear in (self.q_proj, self.k_proj, self.v_proj):
             nn.init.trunc_normal_(
-                w.weight,
+                linear.weight,
                 mean=0.0,
                 std=init_std,
                 a=-3 * init_std,
@@ -409,92 +400,147 @@ class Attention(nn.Module):
             )
 
         nn.init.trunc_normal_(
-            self.wo.weight,
+            self.o_proj.weight,
             mean=0.0,
             std=init_std / factor,
             a=-3 * init_std,
             b=3 * init_std,
         )
 
+    @staticmethod
+    def reshape_for_broadcast(
+        freqs_cis: torch.Tensor, x: torch.Tensor, seq_dim: int
+    ) -> torch.Tensor:
+        """
+        Reshape frequency tensor for broadcasting it with another tensor.
+
+        This function reshapes the frequency tensor to have the same shape as the target tensor 'x'
+        for the purpose of broadcasting the frequency tensor during element-wise operations.
+
+        Args:
+            freqs_cis (torch.Tensor): Frequency tensor to be reshaped.
+            x (torch.Tensor): Target tensor for broadcasting compatibility.
+            seq_dim (int): Sequence dimension index.
+
+        Returns:
+            torch.Tensor: Reshaped frequency tensor.
+        """
+        ndim = x.ndim
+        assert 0 <= seq_dim < ndim
+        assert freqs_cis.shape == (
+            x.shape[seq_dim],
+            x.shape[-3],
+            2,
+            2,
+        ), f"freqs_cis vs x: {(freqs_cis.shape, x.shape)}"
+        shape = [
+            d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-2])
+        ] + [2, 2]
+        return freqs_cis.view(*shape)
+
+    @staticmethod
+    def apply_rotary_emb(
+        queries: torch.Tensor,
+        keys: torch.Tensor,
+        seq_dim: int,
+        freqs_cis: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        queries_ = queries.reshape(*queries.shape[:-1], -1, 1, 2)  # B S H D -> B S H D/2 1 2
+        keys_ = keys.reshape(*keys.shape[:-1], -1, 1, 2)  # B S H D -> B S H D/2 1 2
+        freqs_cis = Attention.reshape_for_broadcast(
+            freqs_cis, queries_, seq_dim
+        ).float()  # S D/2 2 2 -> 1 S 1 D/2 2 2
+        queries_out = (queries_ * freqs_cis).sum(5).flatten(3)
+        keys_out = (keys_ * freqs_cis).sum(5).flatten(3)
+        return queries_out.type_as(queries), keys_out.type_as(keys)
+
+    @staticmethod
+    def repeat_kv(x: torch.Tensor, n_rep: int, dim: int) -> torch.Tensor:
+        """torch.repeat_interleave(x, dim=2, repeats=n_rep)"""
+        assert dim == 2, "Only dim=2 is supported. Check the implementation for other dims."
+
+        bs, slen, n_kv_heads, head_dim = x.shape
+        if n_rep == 1:
+            return x
+        return (
+            x[:, :, :, None, :]
+            .expand(bs, slen, n_kv_heads, n_rep, head_dim)
+            .reshape(bs, slen, n_kv_heads * n_rep, head_dim)
+        )
+
 
 class FeedForward(nn.Module):
     def __init__(
-        self,
+        self: Self,
         dim: int,
         hidden_dim: int,
         multiple_of: int,
-        ffn_dim_multiplier: Optional[float],
-        mp_size: int = 1,
-    ):
+    ) -> None:
         super().__init__()
 
-        hidden_dim = int(2 * hidden_dim / 3)
-        if ffn_dim_multiplier is not None:
-            hidden_dim = int(ffn_dim_multiplier * hidden_dim)
+        # snap hidden_dim to the next highest multiple of multiple_of
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
-        assert hidden_dim % mp_size == 0
 
         self.dim = dim
         self.hidden_dim = hidden_dim
 
-        self.w1 = nn.Linear(
+        self.up_proj = nn.Linear(
             dim,
             hidden_dim,
             bias=False,
         )
-        self.w3 = nn.Linear(
+        self.gate_proj = nn.Linear(
             dim,
             hidden_dim,
             bias=False,
         )
-        self.w2 = nn.Linear(
+        self.down_proj = nn.Linear(
             hidden_dim,
             dim,
             bias=False,
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # B S D
-        x1 = self.w1(x.view_as(x))
-        x3 = self.w3(x.view_as(x))
-        output = self.w2(F.silu(x1) * x3)
+    def forward(self: Self, x: torch.Tensor) -> torch.Tensor:
+        # x of shape B S D
+        h = self.up_proj(x.view_as(x))
+        h_gate = self.gate_proj(x.view_as(x))
+        output = self.down_proj(F.silu(h_gate) * h)
+
         return output
 
-    def reset_parameters(self, init_std=None, factor=1.0):
+    def reset_parameters(self: Self, init_std=None, factor=1.0) -> None:
         in_init_std = init_std or (self.dim ** (-0.5))
         out_init_std = init_std or (self.hidden_dim ** (-0.5))
+
         in_init_std = in_init_std
         out_init_std = out_init_std / factor
-        for w in [self.w1, self.w3]:
+
+        for linear, init_std in zip(
+            (self.up_proj, self.gate_proj, self.down_proj),
+            (in_init_std, in_init_std, out_init_std),
+        ):
             nn.init.trunc_normal_(
-                w.weight,
+                linear.weight,
                 mean=0.0,
-                std=in_init_std,
-                a=-3 * in_init_std,
-                b=3 * in_init_std,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
             )
-        nn.init.trunc_normal_(
-            self.w2.weight,
-            mean=0.0,
-            std=out_init_std,
-            a=-3 * out_init_std,
-            b=3 * out_init_std,
-        )
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, args: BaseTransformerArgs):
+    def __init__(self: Self, args: BaseTransformerArgs) -> None:
         super().__init__()
 
-        assert (args.head_dim is not None) or (
-            args.n_heads is not None
-        ), "Should specify at least head_dim or n_heads"
+        assert (args.head_dim is not None) or (args.n_heads is not None), (
+            "Should specify at least head_dim or n_heads"
+        )
         self.head_dim = args.head_dim or args.dim // args.n_heads
         self.n_heads = args.n_heads or args.dim // args.head_dim
         self.n_kv_heads = args.n_kv_heads or self.n_heads
 
-        assert args.n_heads % self.n_kv_heads == 0
-        assert args.dim % args.n_heads == 0
+        assert args.n_heads % self.n_kv_heads == 0, "n_heads should be a multiple of n_kv_heads"
+        assert args.dim % args.n_heads == 0, "dim should be a multiple of n_heads"
 
         self.attention = Attention(
             dim=args.dim,
@@ -505,22 +551,20 @@ class TransformerBlock(nn.Module):
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
-            hidden_dim=4 * args.dim,
+            hidden_dim=args.hidden_dim or args.dim * 4 * 2 // 3,
             multiple_of=args.multiple_of,
-            ffn_dim_multiplier=args.ffn_dim_multiplier,
         )
         self.attention_norm = RMSNorm(args.dim, eps=args.norm_eps)
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(
-        self,
+        self: Self,
         x: torch.Tensor,
         freq_cis: torch.Tensor,
-        tok_idx: Optional[torch.Tensor] = None,
-        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
-        attn_impl: str = "sdpa",
+        tok_idx: torch.Tensor | None = None,
+        mask: BlockMask | AttentionBias | str | None = None,
+        attn_impl: AttentionImpl = AttentionImpl.SDPA,
     ) -> torch.Tensor:
-
         h = x + self.attention(
             self.attention_norm(x),
             freq_cis,
@@ -528,10 +572,12 @@ class TransformerBlock(nn.Module):
             mask=mask,
             attn_impl=attn_impl,
         )
+
         out = h + self.feed_forward(self.ffn_norm(h))
+
         return out
 
-    def init_weights(self, init_std=None, factor=1.0):
+    def init_weights(self: Self, init_std=None, factor=1.0) -> None:
         self.attention.reset_parameters(init_std, factor)
         self.attention_norm.reset_parameters()
 
@@ -540,11 +586,13 @@ class TransformerBlock(nn.Module):
 
 
 class BaseTransformer(nn.Module):
-    def __init__(self, args: BaseTransformerArgs):
+    def __init__(self: Self, args: BaseTransformerArgs) -> None:
         super().__init__()
         self.dim = args.dim
         self.init_base_std = args.init_base_std
-        self.init_std_factor = InitStdFactor(args.init_std_factor)
+        self.init_std_factor = args.init_std_factor
+        self.init_std_factor_fn = partial(self.INIT_STD_FACTOR_FNS[self.init_std_factor], self)
+
         self.max_seqlen = args.max_seqlen
         self.rope_embeddings = RotaryEmbedding(
             theta=args.rope_theta,
@@ -552,36 +600,35 @@ class BaseTransformer(nn.Module):
             max_seqlen=args.max_seqlen,
         )
 
-        self.layers = nn.ModuleList()
-        for _ in range(args.n_layers):
-            self.layers.append(TransformerBlock(args))
+        self.layers = nn.ModuleList([TransformerBlock(args) for _ in range(args.n_layers)])
 
     def forward(
-        self,
-        h,
-        tok_idx: Optional[torch.Tensor] = None,
-        mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
-        attn_impl: str = "sdpa",
-    ):
-
+        self: Self,
+        h: torch.Tensor,
+        tok_idx: torch.Tensor | None = None,
+        mask: BlockMask | AttentionBias | str | None = None,
+        attn_impl: AttentionImpl = AttentionImpl.SDPA,
+    ) -> torch.Tensor:
         freq_cis = self.rope_embeddings(seqlen=self.max_seqlen, tok_idx=tok_idx)
 
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             h = layer(h, freq_cis, tok_idx=tok_idx, mask=mask, attn_impl=attn_impl)
+
         return h
 
-    def reset_parameters(self):
-        # Either use fixed base std or sqrt model dim
+    def reset_parameters(self: Self) -> None:
         self.rope_embeddings.reset_parameters()
 
-    def init_weights(self):
+    INIT_STD_FACTOR_FNS = {
+        InitStdFactor.CURRENT_DEPTH: lambda self, depth: (2 * (depth + 1)) ** 0.5,
+        InitStdFactor.GLOBAL_DEPTH: lambda self, depth: (2 * (len(self.layers) + 1)) ** 0.5,
+        InitStdFactor.DIM_RATIO: lambda self, depth: self.dim / 4096,
+        InitStdFactor.DISABLED: lambda self, depth: 1.0,
+    }
+
+    def init_weights(self: Self) -> None:
         self.reset_parameters()
         for depth, layer in enumerate(self.layers):
-            factor = {
-                InitStdFactor.CURRENT_DEPTH: (2 * (depth + 1)) ** 0.5,
-                InitStdFactor.GLOBAL_DEPTH: (2 * (len(self.layers) + 1)) ** 0.5,
-                InitStdFactor.DIM_RATIO: self.dim / 4096,
-                InitStdFactor.DISABLED: 1.0,
-            }[self.init_std_factor]
+            factor = self.init_std_factor_fn(depth)
 
             layer.init_weights(self.init_base_std, factor)

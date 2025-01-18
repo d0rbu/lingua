@@ -1,21 +1,22 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-import argparse
 import logging
-from omegaconf import OmegaConf, DictConfig, ListConfig
 from typing import Type, TypeVar
+
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 logger = logging.getLogger()
 
 T = TypeVar("T")
 
-def set_struct_recursively(cfg, strict: bool = True):
+
+def set_struct_recursively(cfg: DictConfig | ListConfig, strict: bool = True) -> None:
     # Set struct mode for the current level
     OmegaConf.set_struct(cfg, strict)
 
     # Traverse through nested dictionaries and lists
     if isinstance(cfg, DictConfig):
-        for key, value in cfg.items():
+        for value in cfg.values():
             if isinstance(value, (DictConfig, ListConfig)):
                 set_struct_recursively(value, strict)
     elif isinstance(cfg, ListConfig):
@@ -24,14 +25,14 @@ def set_struct_recursively(cfg, strict: bool = True):
                 set_struct_recursively(item, strict)
 
 
-def flatten_dict(d, parent_key="", sep="_"):
+def flatten_dict(dictionary: dict, parent_key="", sep="_"):
     items = []
-    for k, v in d.items():
-        new_key = f"{parent_key}{sep}{k}" if parent_key else k
-        if isinstance(v, dict):
-            items.extend(flatten_dict(v, new_key, sep=sep).items())
+    for key, value in dictionary.items():
+        new_key = f"{parent_key}{sep}{key}" if parent_key else key
+        if isinstance(value, dict):
+            items.extend(flatten_dict(value, new_key, sep=sep).items())
         else:
-            items.append((new_key, v))
+            items.append((new_key, value))
     return dict(items)
 
 

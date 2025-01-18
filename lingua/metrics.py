@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 import torch
 import torch.nn as nn
 
-from lingua.distributed import get_is_master
+from lingua.distributed import is_master
 import wandb
 
 logger = logging.getLogger()
@@ -64,7 +64,7 @@ class MetricLogger:
         if (
             self.args is not None
             and self.args.logging.wandb is not None
-            and get_is_master()
+            and is_master()
         ):
             run = wandb.init(
                 config=asdict(self.args),

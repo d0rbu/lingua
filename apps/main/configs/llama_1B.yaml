@@ -49,10 +49,10 @@ profiling:
 checkpoint:
   dump:
     every: 2500
-    keep: 3
+    keep_last: 3
   eval:
     every: 5000
-    keep: -1
+    keep_last: -1
 
 logging:
   freq: 1

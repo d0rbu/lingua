@@ -26,7 +26,6 @@ model:
   n_layers: 32
   n_heads: 32
   rope_theta: 100_000
-  ffn_dim_multiplier: 1.0
   multiple_of: 256
 
 data:
@@ -52,10 +51,10 @@ profiling:
 checkpoint:
   dump:
     every: 10000
-    keep: -1
+    keep_last: -1
   eval:
     every: 1000
-    keep: 3
+    keep_last: 3
 
 logging:
   freq: 1

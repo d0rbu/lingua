@@ -23,6 +23,7 @@ from lingua.transformer import (
     generate_doc_mask_mod,
     lengths_to_local_ids,
     lengths_to_start_ids,
+    AttentionImpl,
 )
 from torch.nn.attention.flex_attention import create_block_mask
 
@@ -291,7 +292,7 @@ class PackedCausalTransformerGenerator:
             tokens,
             tok_idx=self.prefill_tok_id,
             mask=self.prefill_mask,
-            attn_impl="flex_attention",
+            attn_impl=AttentionImpl.FLEX_ATTENTION,
         )
         self.setup_generation(lengths=lengths)
         return prefill_out
@@ -314,7 +315,7 @@ class PackedCausalTransformerGenerator:
             current_token,
             tok_idx=self.current_tok_id,  # n_seqs
             mask=mask,
-            attn_impl="sdpa",
+            attn_impl=AttentionImpl.SDPA,
         )
         self.current_tok_id += 1
         return out
@@ -420,6 +421,7 @@ def load_consolidated_model_and_tokenizer(
     model = model.cuda().eval()
     for param in model.parameters():
         param.data = param.data.to(dtype=param_dtype)
+
     return model, tokenizer, config
 
 

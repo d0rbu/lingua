@@ -20,7 +20,7 @@ from apps.main.generate import (
 )
 from apps.main.transformer import LMTransformer, LMTransformerArgs
 from lingua.args import dump_config
-from lingua.checkpoint import CONSOLIDATE_FOLDER, consolidate_checkpoints
+from lingua.checkpoint import CONSOLIDATED_FOLDER, consolidate_checkpoints
 from lingua.data import init_choice_state, setup_sources
 from lingua.distributed import (
     DistributedArgs,
@@ -226,7 +226,7 @@ def launch_eval(cfg: EvalArgs):
     ):
         consolidate_path = Path(cfg.ckpt_dir)
     else:
-        consolidate_path = Path(cfg.ckpt_dir) / CONSOLIDATE_FOLDER
+        consolidate_path = Path(cfg.ckpt_dir) / CONSOLIDATED_FOLDER
         if not consolidate_path.exists() and get_global_rank() == 0:
             consolidate_path = consolidate_checkpoints(cfg.ckpt_dir)
 
@@ -293,13 +293,13 @@ def main():
     @dataclass
     class DummyArgs:
         name: str
-        model: LMTransformerArgsgs
+        model: LMTransformerArgs
 
     @dataclass
-    class LMTransformerArgsgs:
+    class LMTransformerArgs:
         dim: int
 
-    Then you can pass model.dim=32 to change values in LMTransformerArgsgs
+    Then you can pass model.dim=32 to change values in LMTransformerArgs
     or just name=tictac for top level attributes.
 
     The behavior here is as follows:

@@ -22,24 +22,27 @@ from lingua.transformer import (
     BaseTransformerArgs,
     RMSNorm,
     cross_entropy,
+    causal_mask,
+    AttentionImpl
 )
 
 
-def create_causal_mask(seqlen, attn_impl, sliding_window):
-    if sliding_window is not None and attn_impl == "xformers":
-        return fmha.attn_bias.LocalAttentionFromBottomRightMask(
-            window_left=sliding_window - 1, window_right=0
-        )
-    elif attn_impl == "xformers":
-        return fmha.attn_bias.LowerTriangularMask()
-    elif attn_impl == "sdpa":
-        return "causal"
-    elif attn_impl == "flex_attention":
-        return create_block_mask(causal_mask, None, None, seqlen, seqlen)
-    else:
-        raise NotImplementedError(
-            f"Attention {attn_impl} with {sliding_window} sliding window not implemented"
-        )
+def create_causal_mask(seqlen: int, attn_impl: AttentionImpl, sliding_window: int | None) -> BlockMask | AttentionBias | torch.Tensor | str:
+    match sliding_window, attn_impl:
+        case None, AttentionImpl.XFORMERS:
+            return fmha.attn_bias.LowerTriangularMask()
+        case _, AttentionImpl.XFORMERS:
+            return fmha.attn_bias.LocalAttentionFromBottomRightMask(
+                window_left=sliding_window - 1, window_right=0
+            )
+        case _, AttentionImpl.SDPA:
+            return "causal"
+        case _, AttentionImpl.FLEX_ATTENTION:
+            return create_block_mask(causal_mask, None, None, seqlen, seqlen)
+        case _, _:
+            raise NotImplementedError(
+                f"Attention {attn_impl} with {sliding_window} sliding window not implemented"
+            )
 
 
 def attention_flops_per_token(n_layers, seq_len, dim, causal):
@@ -55,19 +58,14 @@ def get_num_flop_per_token(
     )
 
 
-def causal_mask(b, h, q_idx, kv_idx):
-    return q_idx >= kv_idx
-
-
 @dataclass
 class LMTransformerArgs(BaseTransformerArgs):
-
     seed: int = 42
 
     vocab_size: int = -1
     weight_tying: bool = False
 
-    sliding_window: Optional[int] = None
+    sliding_window: int | None = None
 
 
 class LMTransformer(BaseTransformer):
@@ -97,7 +95,7 @@ class LMTransformer(BaseTransformer):
         target: Optional[torch.Tensor] = None,
         tok_idx: Optional[torch.Tensor] = None,
         mask: Optional[Union[BlockMask, AttentionBias, torch.Tensor, str]] = None,
-        attn_impl: str = "sdpa",
+        attn_impl: AttentionImpl = AttentionImpl.SDPA,
     ):
         bsz, seqlen = token_values.shape
 
