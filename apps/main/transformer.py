@@ -35,9 +35,9 @@ def create_causal_mask(seqlen: int, attn_impl: AttentionImpl, sliding_window: in
             return fmha.attn_bias.LocalAttentionFromBottomRightMask(
                 window_left=sliding_window - 1, window_right=0
             )
-        case _, AttentionImpl.SDPA:
+        case None, AttentionImpl.SDPA:
             return "causal"
-        case _, AttentionImpl.FLEX_ATTENTION:
+        case None, AttentionImpl.FLEX_ATTENTION:
             return create_block_mask(causal_mask, None, None, seqlen, seqlen)
         case _, _:
             raise NotImplementedError(
