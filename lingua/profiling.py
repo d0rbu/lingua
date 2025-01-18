@@ -113,7 +113,7 @@ class MemSnapshotsProfilerWandb(MemSnapshotsProfiler):
 
 
 @contextlib.contextmanager
-def maybe_run_profiler(dump_dir: str, module: torch.nn.Module, config: ProfilerArgs) -> Generator
+def maybe_run_profiler(dump_dir: str, module: torch.nn.Module, config: ProfilerArgs) -> Generator:
     # get user defined profiler settings
 
     if config.run:
