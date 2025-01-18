@@ -2,7 +2,7 @@
 
 ## DISCLAIMER ABOUT THIS FORK
 
-I only focused on using apps/main and thus removed the other apps. If you find yourself needing those then add them back yourself or use the original meta/lingua.
+I only focused on using apps/main and thus the other apps are unchanged and likely not working.
 
 **Mathurin Videau***, **Badr Youbi Idrissi***, Daniel Haziza, Luca Wehrstedt, Jade Copet, Olivier Teytaud, David Lopez-Paz. ***Equal and main contribution**
 
