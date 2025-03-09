@@ -11,11 +11,12 @@ import requests
 from huggingface_hub import snapshot_download
 
 
+
 @dataclass
 class DatasetConfig:
     repo_id: str
     orig_extension: str = ".jsonl"
-    cat_command: str = "cat"
+    cat_command: str = "cat {}"
     allow_patterns: str | None = None
 
 
@@ -30,13 +31,13 @@ DATASET_CONFIGS = {
     "dclm_baseline_1.0": DatasetConfig(
         repo_id="mlfoundations/dclm-baseline-1.0",
         orig_extension=".jsonl.zst",
-        cat_command="zstdcat",
+        cat_command="zstdcat {} && echo",
         allow_patterns="*.jsonl.zst",
     ),
     "dclm_baseline_1.0_10prct": DatasetConfig(
         repo_id="mlfoundations/dclm-baseline-1.0",
         orig_extension=".jsonl.zst",
-        cat_command="zstdcat",
+        cat_command="zstdcat {} && echo",
         allow_patterns="global-shard_01_of_10/*.jsonl.zst",
     ),
     "meta_math_qa": DatasetConfig(
@@ -189,7 +190,7 @@ def main(dataset: str, memory: float, data_dir: str, seed: int = 42, nchunks: in
     terashuf_executable = os.path.join(terashuf_dir, "terashuf")
     run_command(
         f"ulimit -n 100000 && "
-        f"find {src_dir} -type f -name '*{config.orig_extension}' -print0 | xargs -0 {config.cat_command} | {terashuf_executable} | "
+        f"find {src_dir} -type f -name '*{config.orig_extension}' -print0 | xargs -0 -I {{}} sh -c '{config.cat_command}' | {terashuf_executable} | "
         f"split -n r/{nchunks} -d --suffix-length 2 --additional-suffix {suffix} - {out_dir}/{prefix}"
         "; trap 'echo \"Caught signal 13, exiting with code 1\"; exit 1' SIGPIPE;"
     )

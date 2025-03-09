@@ -112,6 +112,7 @@ def validate_train_args(args: TrainArgs, output_size: int) -> None:
     assert args.dump_dir, "Dump dir not set"
 
     if args.checkpoint.path is None:
+        logger.info(f"Setting checkpoint path to {str(Path(args.dump_dir) / 'checkpoints')}")
         args.checkpoint.path = str(Path(args.dump_dir) / "checkpoints")
         logger.info(f"Setting checkpoint path to {args.checkpoint.path}")
 
@@ -328,7 +329,6 @@ def train(args: TrainArgs) -> None:
                     else None
                 ),
             )
-            probe_mod = model._orig_mod if args.distributed.compile else model
 
         gc.disable()
 
@@ -397,9 +397,9 @@ def train(args: TrainArgs) -> None:
                 # Here we do a fake forward and backward pass on a smaller
                 # batch size to avoid OOM
                 # This assumes the model has no stateful layers (batch norm..)
-                assert next(probe_mod.parameters()).grad is None, (
-                    "Can't probe model if grads are not reset"
-                )
+                assert (
+                    next(model.parameters()).grad is None
+                ), "Can't probe model if grads are not reset"
 
                 with probe:
                     probe.metadata = {
@@ -411,7 +411,7 @@ def train(args: TrainArgs) -> None:
                     # So we divide bsz by 2 or seqlen by 2
                     probe_bsz = max(1, bsz // 2)
                     probe_seq = seqlen if (bsz // 2 >= 1) else (seqlen // 2)
-                    probe_loss = probe_mod(
+                    probe_loss = model(
                         input_ids[:probe_bsz, :probe_seq],
                         labels[:probe_bsz, :probe_seq],
                     )
@@ -419,9 +419,9 @@ def train(args: TrainArgs) -> None:
                     # We zero grads to cancel this fake step
                     optimizer.zero_grad()
 
-                assert next(probe_mod.parameters()).grad is None, (
-                    "Probe model shouldn't have grads at this point"
-                )
+                assert (
+                    next(model.parameters()).grad is None
+                ), "Probe model shouldn't have grads at this point"
 
             loss = model(input_ids, labels)
 
