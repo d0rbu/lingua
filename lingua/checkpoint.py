@@ -24,6 +24,7 @@ from torch.distributed.checkpoint.state_dict import (
 )
 
 from lingua.distributed import is_master
+from lingua.args import EnumEncoder, enum_decoder
 from lingua.train import TrainState
 
 logger = logging.getLogger("CHECKPOINT")
@@ -204,8 +205,8 @@ class CheckpointManager:
 
         return dp_rank, tp_rank
 
-    @torch.no_grad()
     @staticmethod
+    @torch.no_grad()
     def get_state_dict(
         model: nn.Module,
         optimizer: torch.optim.Optimizer,
@@ -244,6 +245,8 @@ class CheckpointManager:
                 json.dump(
                     OmegaConf.to_container(OmegaConf.structured(config), resolve=True),
                     f,
+                    indent=4,
+                    cls=EnumEncoder,
                 )
 
         # Add json dump here
@@ -253,7 +256,7 @@ class CheckpointManager:
             train_state_path = current_save_dir / train_state_name
             logger.info(f"Saving train state to: {train_state_path}")
             with open(train_state_path, "w") as f:
-                json.dump(train_state.state_dict(), f)
+                json.dump(train_state.state_dict(), f, indent=4, cls=EnumEncoder)
             logger.info("Train state saved !")
 
         self.existing_saves.append(current_save_dir)

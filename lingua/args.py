@@ -1,9 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 import logging
+import json
 from typing import Type, TypeVar
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
+
+from lingua.optim import SchedulerType, TargetParams
+from lingua.transformer import InitStdFactor, RoPEType
+from lingua.data import DatasetType
+from lingua.tokenizer import TokenizerType
 
 logger = logging.getLogger()
 
@@ -34,6 +40,34 @@ def flatten_dict(dictionary: dict, parent_key="", sep="_"):
         else:
             items.append((new_key, value))
     return dict(items)
+
+
+ENCODED_ENUMS = {
+    SchedulerType,
+    InitStdFactor,
+    DatasetType,
+    TargetParams,
+    RoPEType,
+    TokenizerType,
+}
+
+class EnumEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if type(obj) in ENCODED_ENUMS:
+            return {"__enum__": str(obj)}
+        return json.JSONEncoder.default(self, obj)
+
+
+def enum_decoder(obj):
+    if "__enum__" in obj:
+        name, member = obj["__enum__"].split(".")
+
+        enum_class = next((enum for enum in ENCODED_ENUMS if enum.__name__ == name), None)
+        if enum_class is None:
+            raise ValueError(f"Unknown enum class: {name}")
+
+        return getattr(enum_class, member)
+    return obj
 
 
 def dataclass_from_dict(cls: Type[T], data: dict, strict: bool = True) -> T:

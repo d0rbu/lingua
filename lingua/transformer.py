@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-from dataclasses import dataclass
+import math
+from dataclasses import dataclass, field
 from functools import partial
 from enum import Enum
 from typing import Self
@@ -32,6 +33,23 @@ class AttentionImpl(Enum):
     FMHA = "fmha"
     FLEX_ATTENTION = "flex_attention"
     XFORMERS = "xformers"
+
+class RoPEType(Enum):
+    DEFAULT = "default"
+    LLAMA3 = "llama3"
+
+@dataclass
+class RoPEScalingArgs:
+    type: RoPEType = RoPEType.DEFAULT
+    factor: float = 32.0
+    original_max_position_embeddings: int = field(default=8192)
+    attention_factor: float | None = None
+    beta_fast: float = 32.0
+    beta_slow: float = 1.0
+    short_factor: list[float] = field(default_factory=lambda: [])
+    long_factor: list[float] = field(default_factory=lambda: [])
+    low_freq_factor: float = 1.0
+    high_freq_factor: float = 4.0
 
 
 @dataclass
@@ -152,23 +170,39 @@ class RotaryEmbedding(torch.nn.Module):
     """
 
     def __init__(
-        self: Self, theta: float, head_dim: int, max_seqlen: int = 1024
+        self: Self,
+        theta: float,
+        head_dim: int,
+        max_seqlen: int = 1024,
+        scaling_args: RoPEScalingArgs = RoPEScalingArgs(),
     ) -> None:
         super().__init__()
 
         self.theta = theta
         self.head_dim = head_dim
         self.max_seqlen = max_seqlen
+        self.scaling_args = scaling_args
+
+        self.inv_freq_init_fn = self.INV_FREQ_INIT_FNS.get(scaling_args.type, None)
+        assert self.inv_freq_init_fn is not None, f"RoPE type {scaling_args.type} not supported"
 
         self.register_buffer(
             "freqs_cis",
-            self.precompute_freqs_cis(dim=head_dim, end=max_seqlen, theta=theta),
+            self.compute_freqs_cis(
+                dim=self.head_dim,
+                end=self.max_seqlen,
+                theta=self.theta,
+                scaling_args=self.scaling_args,
+            ),
             persistent=False,
         )
 
     def reset_parameters(self: Self) -> None:
-        self.freqs_cis[...] = self.precompute_freqs_cis(
-            dim=self.head_dim, end=self.max_seqlen, theta=self.theta
+        self.freqs_cis[...] = self.compute_freqs_cis(
+            dim=self.head_dim,
+            end=self.max_seqlen,
+            theta=self.theta,
+            scaling_args=self.scaling_args,
         )
 
     def forward(
@@ -190,12 +224,53 @@ class RotaryEmbedding(torch.nn.Module):
         elif seqlen is not None:
             return self.freqs_cis[0:seqlen]
 
-    @staticmethod
-    def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+    def compute_freqs_cis(
+        self: Self,
+        dim: int,
+        end: int,
+        theta: float = 10_000.0,
+        scaling_args: RoPEScalingArgs = RoPEScalingArgs(),
+    ) -> torch.Tensor:
         """
         Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
 
-        This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
+        Using the given dimension 'dim' and the end index 'end', this function calculates a frequency tensor
+        with complex exponentials. The 'theta' parameter scales the frequencies. The parameters are based on
+        the ones returned by the RoPE inverse frequency computation function.
+
+        Args:
+            dim (int): Dimension of the frequency tensor.
+            end (int): End index for precomputing frequencies.
+            theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+            scaling_args (RoPEScalingArgs, optional): RoPE scaling arguments. Defaults to RoPEScalingArgs().
+
+        Returns:
+            torch.Tensor: Precomputed frequency tensor with complex exponentials.
+        """
+        inv_freq = self.inv_freq_init_fn(
+            dim=dim,
+            end=end,
+            theta=theta,
+            scaling_args=scaling_args,
+        )
+        t = torch.arange(end, device=inv_freq.device).float()
+
+        freqs_cis = torch.outer(t, inv_freq).float()
+        cos, sin = freqs_cis.cos(), freqs_cis.sin()
+
+        return torch.stack((cos, -sin, sin, cos), dim=-1).view(*freqs_cis.size(), 2, 2)
+
+    @staticmethod
+    def compute_default_inv_freq(
+        dim: int,
+        end: int,
+        theta: float = 10_000.0,
+        scaling_args: RoPEScalingArgs = RoPEScalingArgs(),
+    ) -> torch.Tensor:
+        """
+        Precompute the inverse frequency tensor for complex exponentials (cis) with given dimensions.
+
+        This function calculates the inverse frequency tensor for complex exponentials using the given dimension 'dim'
         and the end index 'end'. The 'theta' parameter scales the frequencies.
         The returned tensor contains complex values in complex64 data type.
 
@@ -203,17 +278,76 @@ class RotaryEmbedding(torch.nn.Module):
             dim (int): Dimension of the frequency tensor.
             end (int): End index for precomputing frequencies.
             theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+            scaling_args (RoPEScalingArgs, optional): RoPE scaling arguments. Defaults to RoPEScalingArgs().
 
         Returns:
             torch.Tensor: Precomputed frequency tensor with complex exponentials.
         """
-        freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
-        t = torch.arange(end, device=freqs.device)
-        freqs = torch.outer(t, freqs).float()
+        return 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=torch.int64).float()[: (dim // 2)] / dim))
 
-        cos, sin = freqs.cos(), freqs.sin()
+    @staticmethod
+    def compute_llama3_inv_freq(
+        dim: int,
+        end: int,
+        theta: float = 10_000.0,
+        scaling_args: RoPEScalingArgs = RoPEScalingArgs(),
+    ) -> torch.Tensor:
+        """
+        Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
 
-        return torch.stack((cos, -sin, sin, cos), dim=-1).view(*freqs.size(), 2, 2)
+        This function calculates a frequency tensor with complex exponentials using the given dimension 'dim'
+        and the end index 'end'. The 'theta' parameter scales the frequencies.
+        The difference is that this function stretches the frequency tensor llama3-style.
+        The returned tensor contains complex values in complex64 data type.
+
+        Args:
+            dim (int): Dimension of the frequency tensor.
+            end (int): End index for precomputing frequencies.
+            theta (float, optional): Scaling factor for frequency computation. Defaults to 10000.0.
+            scaling_args (RoPEScalingArgs, optional): RoPE scaling arguments. Defaults to RoPEScalingArgs().
+
+        Returns:
+            torch.Tensor: Precomputed frequency tensor with complex exponentials.
+        """
+        default_inv_freq = RotaryEmbedding.compute_default_inv_freq(
+            dim=dim,
+            end=end,
+            theta=theta,
+            scaling_args=scaling_args,
+        )
+
+        factor = scaling_args.factor
+        low_freq_factor = scaling_args.low_freq_factor
+        high_freq_factor = scaling_args.high_freq_factor
+        old_context_len = scaling_args.original_max_position_embeddings
+
+        low_freq_wavelen = old_context_len / low_freq_factor
+        high_freq_wavelen = old_context_len / high_freq_factor
+
+        wavelen = 2 * math.pi / default_inv_freq
+        # wavelen < high_freq_wavelen: do nothing
+        # wavelen > low_freq_wavelen: divide by factor
+        inv_freq = torch.where(
+            wavelen > low_freq_wavelen,
+            default_inv_freq / factor,
+            default_inv_freq,
+        )
+        # otherwise: interpolate between the two, using a smooth factor
+        smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
+        smoothed_inv_freq = (1 - smooth_factor) * inv_freq / factor + smooth_factor * inv_freq
+        is_medium_freq = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+        inv_freq = torch.where(
+            is_medium_freq,
+            smoothed_inv_freq,
+            inv_freq,
+        )
+
+        return inv_freq
+
+    INV_FREQ_INIT_FNS = {
+        RoPEType.DEFAULT: compute_default_inv_freq,
+        RoPEType.LLAMA3: compute_llama3_inv_freq,
+    }
 
 
 class RMSNorm(nn.Module):
@@ -609,6 +743,7 @@ class BaseTransformer(nn.Module):
             theta=args.rope_theta,
             head_dim=args.head_dim or args.dim // args.n_heads,
             max_seqlen=args.max_seqlen,
+            scaling_args=args.rope_scaling,
         )
 
         self.layers = nn.ModuleList([TransformerBlock(args) for _ in range(args.n_layers)])
