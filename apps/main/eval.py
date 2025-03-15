@@ -1,15 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 import logging
 import os
 from pathlib import Path
 from lm_eval.api.instance import Instance
 from lm_eval.api.model import LM
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Self, Union
 from lm_eval import simple_evaluate
 from omegaconf import OmegaConf
 import torch
@@ -59,6 +59,7 @@ class LMHarnessArgs:
     numpy_random_seed: int = 1234
     torch_random_seed: int = 1234
     fewshot_random_seed: int = 1234
+    batch_size: int | str = 8  # If str, it should be "auto"
 
 @dataclass
 class ValidationArgs:
@@ -103,6 +104,12 @@ class MockAccelerator:
         torch.distributed.barrier()
 
 
+@dataclass
+class OrderedPrompt:
+    text: str
+    idx: int
+
+
 # Light wrapper around generator for lm-eval harness
 class EvalHarnessLM(LM):
     def __init__(self, generator):
@@ -114,27 +121,65 @@ class EvalHarnessLM(LM):
         self.device = generator.device
 
     def generate_until(self, requests: List[Instance]) -> List[str]:
+        num_requests = len(requests)
+
         prompts, gen_args = zip(*[req.args for req in requests])
-        assert all_dicts_same(gen_args), "Doesn't support different gen args for now"
-        gen_args = gen_args[0]
-        temperature = gen_args.get("temperature", 0.0)
-        top_p = gen_args.get("top_p", None)
-        top_k = gen_args.get("top_k", None)
-        until = gen_args.get("until", [])
 
-        self.generator.temperature = temperature
-        self.generator.top_p = top_p
-        self.generator.top_k = top_k
-        self.generator.until = until
-        generations, _, _ = self.generator.generate(prompts)
-        filtered_gen = []
-        for g in generations:
-            for e in until:
-                g = g.replace(e, "")
-            filtered_gen.append(g)
-        return filtered_gen
+        prompt_groups, unique_gen_args = self.partition_by_gen_args(prompts, gen_args)
 
-    def loglikelihood(self, requests: List[Instance]) -> List[Tuple[float, bool]]:
+        filtered_generations = [None] * num_requests
+
+        for ordered_prompts, gen_args in zip(prompt_groups, unique_gen_args):
+            prompts = [ordered_prompt.text for ordered_prompt in ordered_prompts]
+            indices = [ordered_prompt.idx for ordered_prompt in ordered_prompts]
+
+            until = gen_args.get("until", [])
+
+            self.generator.temperature = gen_args.get("temperature", 0.0)
+            self.generator.top_p = gen_args.get("top_p", None)
+            self.generator.top_k = gen_args.get("top_k", None)
+            self.generator.until = until
+
+            generations, _, _ = self.generator.generate(prompts)
+
+            for generation, idx in zip(generations, indices):
+                for end_str in until:
+                    generation = generation.replace(end_str, "")
+
+                filtered_generations[idx] = generation
+
+        return filtered_generations
+
+    def partition_by_gen_args(self: Self, prompts: list[str], gen_args: list[dict]) -> tuple[list[list[OrderedPrompt]], list[dict]]:
+        """
+        Partitions the prompts and gen_args by the gen_args values
+
+        This function does shuffle the prompts to ensure contiguity, so the original order is also returned
+        """
+        # Make the values of gen_args hashable by turning the until list into a tuple
+        hashable_gen_args = [
+            {**gen_arg, "until": tuple(gen_arg.get("until", []))}
+            for gen_arg in gen_args
+        ]
+
+        hashed_gen_args = [
+            (hash(frozenset(hashable_gen_arg.items())), gen_arg)
+            for gen_arg, hashable_gen_arg in zip(gen_args, hashable_gen_args)
+        ]
+
+        # gen_arg_hash -> [ordered_prompt_0, ordered_prompt_1, ...]
+        prompt_groups = OrderedDict()
+        for i, (prompt, (gen_arg_hash, gen_arg)) in enumerate(zip(prompts, hashed_gen_args)):
+            if gen_arg_hash not in prompt_groups:
+                prompt_groups[gen_arg_hash] = []
+
+            prompt_groups[gen_arg_hash].append(OrderedPrompt(prompt, i))
+
+        hash_to_gen_arg = OrderedDict(hashed_gen_args)
+
+        return list(prompt_groups.values()), list(hash_to_gen_arg.values())
+
+    def loglikelihood(self, requests: List[Instance]) -> List[tuple[float, bool]]:
         prompts, continuations = zip(*[req.args for req in requests])
         inputs = [req.args[0] + req.args[1] for req in requests]
         max_gen_len = self.generator.max_gen_len
@@ -184,12 +229,14 @@ def eval_on_val(generator, val_args: ValidationArgs, train_cfg):
         jsonl_iterator = path_to_iter[src]
         texts = []
         logger.info(f"Running validation on {src}...")
+
         for step, (content, state) in enumerate(jsonl_iterator):
             if state['current_iter'] > 0 or (val_args.max_steps is not None and step >= val_args.max_steps):
                 break
+
             content_key = "text" if ("text" in content) else "content"
             texts.append(content[content_key])
-        
+
         _, loglikelihood, _ = generator.generate(texts)
 
         metrics = defaultdict(list)
@@ -200,7 +247,7 @@ def eval_on_val(generator, val_args: ValidationArgs, train_cfg):
             metrics['nll_per_char'].append(tmp / len(texts[i]))
 
             metrics['avg_seqlen'].append(len(ll))
-        
+
         for m in metrics:
             metrics[m] = sum(metrics[m]) / len(metrics[m])
         metrics.update(dist_mean_dict(metrics))
@@ -246,35 +293,38 @@ def launch_eval(cfg: EvalArgs):
     generator = PackedCausalTransformerGenerator(cfg.generator, model, tokenizer)
 
     wrap = EvalHarnessLM(generator)
-    results = simple_evaluate(wrap, **asdict(cfg.harness))
-    val_results =  None
-    if cfg.validation:
-        val_results = eval_on_val(generator, cfg.validation, train_cfg)
+
+    results = simple_evaluate(wrap, **asdict(cfg.harness)) if cfg.harness else None
+    val_results = eval_on_val(generator, cfg.validation, train_cfg) if cfg.validation else None
     if get_global_rank() == 0:
-        with open(Path(cfg.dump_dir) / "results.json", "w") as f:
-            f.write(json.dumps(results))
-        logger.info(f"All evaluation results: {results['results']}")
-        if val_results is not None:
+        if results:
+            with open(Path(cfg.dump_dir) / "results.json", "w") as f:
+                f.write(json.dumps(results))
+            logger.info(f"All evaluation results: {results['results']}")
+
+        if val_results:
             with open(Path(cfg.dump_dir) / "validation.json", "w") as f:
                 f.write(json.dumps(val_results))
             logger.info(f"All validation results: {val_results}")
-    if cfg.metric_log_dir and get_global_rank() == 0:
-        metric_log_path = Path(cfg.metric_log_dir) / "metrics.eval.jsonl"
 
-        logger.info(f"Writing metric logs to {metric_log_path}")
+    if cfg.metric_log_dir and get_global_rank() == 0:
+        logger.info(f"Writing metric logs to {cfg.metric_log_dir}")
         timestamp = {
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
         }
         if cfg.global_step is not None:
             timestamp["global_step"] = cfg.global_step
-        print(
-            json.dumps(timestamp | results["results"]),
-            file=open(metric_log_path, mode="a"),
-            flush=True,
-        )
 
-        val_log_path = Path(cfg.metric_log_dir) / "metrics.validation.jsonl"
+        if results is not None:
+            metric_log_path = Path(cfg.metric_log_dir) / "metrics.eval.jsonl"
+            print(
+                json.dumps(timestamp | results["results"]),
+                file=open(metric_log_path, mode="a"),
+                flush=True,
+            )
+
         if val_results is not None:
+            val_log_path = Path(cfg.metric_log_dir) / "metrics.validation.jsonl"
             print(
                 json.dumps(timestamp | val_results),
                 file=open(val_log_path, mode="a"),

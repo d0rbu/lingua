@@ -304,7 +304,7 @@ class CheckpointManager:
         ):
             logger.info("Reloading train state")
             with open(train_state_path, "r") as train_state_file:
-                train_state_dict = json.load(train_state_file)
+                train_state_dict = json.load(train_state_file, object_hook=enum_decoder)
             train_state.load_state_dict(train_state_dict)
             logger.info("Train state reloaded")
 
