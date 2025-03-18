@@ -21,6 +21,7 @@ from lingua.tokenizer import Tokenizer, build_tokenizer
 from lingua.transformer import (
     Attention,
     causal_mask,
+    generate_doc_mask_mod,
     lengths_to_local_ids,
     lengths_to_start_ids,
     AttentionImpl,
