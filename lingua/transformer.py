@@ -13,6 +13,7 @@ from torch.nn.attention.flex_attention import (
     BlockMask,
     _mask_mod_signature,
     flex_attention,
+    create_block_mask,
 )
 from xformers.ops import AttentionBias, fmha
 
@@ -108,59 +109,6 @@ def lengths_to_local_ids(lengths: torch.Tensor) -> tuple[torch.Tensor, torch.Ten
     tok_id = torch.arange(total_seqlen, device=lengths.device) - doc_start
 
     return doc_id, tok_id
-
-
-def generate_doc_mask_mod(
-    mask_mod: _mask_mod_signature,
-    lengths: torch.Tensor,
-    kv_lengths: torch.Tensor | None = None,
-) -> _mask_mod_signature:
-    """Generates mask mods that apply to inputs to flex attention in the sequence stacked
-    format.
-
-    Args:
-        mask_mod: The mask mod to apply to the documents
-        lengths: Lengths of each document
-
-    Note:
-        What is the sequence stacked format? When assembling batches of inputs, we
-        take multiple sequences and stack them together to form 1 large sequence. We then
-        use masking to ensure that the attention scores are only applied to tokens within
-        the same document.
-
-    Example:
-
-    - Square mask
-      doc_mask         lengths
-      a a b b b c c    2 3 2
-    a 1 0 0 0 0 0 0
-    a 1 1 0 0 0 0 0
-    b 0 0 1 0 0 0 0
-    b 0 0 1 1 0 0 0
-    b 0 0 1 1 1 0 0
-    c 0 0 0 0 0 1 0
-    c 0 0 0 0 0 1 1
-
-    """
-    kv_lengths = kv_lengths if kv_lengths is not None else lengths
-    q_document_id, q_token_id = lengths_to_local_ids(lengths)
-    kv_document_id, kv_token_id = lengths_to_local_ids(kv_lengths)
-    q_max_idx = lengths.sum() - 1
-    kv_max_idx = kv_lengths.sum() - 1
-
-    def doc_mask_mod(
-        b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
-    ) -> torch.Tensor:
-        q_idx_cap = torch.minimum(q_max_idx, q_idx)
-        kv_idx_cap = torch.minimum(kv_max_idx, kv_idx)
-        valid_idx = (q_idx <= q_max_idx) & (kv_idx <= kv_max_idx)
-        same_doc = q_document_id[q_idx_cap] == kv_document_id[kv_idx_cap]
-        q_logical = q_token_id[q_idx_cap]
-        kv_logical = kv_token_id[kv_idx_cap]
-        inner_mask = mask_mod(b, h, q_logical, kv_logical)
-        return same_doc & inner_mask & valid_idx
-
-    return doc_mask_mod
 
 
 # Rotary embedding as in xformer, see if torchtrain implementation is not better. Also might be usefull to make it work with batch*seqlen collapsed.
@@ -764,6 +712,172 @@ class BaseTransformer(nn.Module):
 
     def reset_parameters(self: Self) -> None:
         self.rope_embeddings.reset_parameters()
+
+    def generate_doc_mask_mod(
+        self: Self,
+        mask_mod: _mask_mod_signature,
+        lengths: torch.Tensor,
+        kv_lengths: torch.Tensor | None = None,
+    ) -> _mask_mod_signature:
+        """Generates mask mods that apply to inputs to flex attention in the sequence stacked
+        format.
+
+        Args:
+            mask_mod: The mask mod to apply to the documents
+            lengths: Lengths of each document
+            kv_lengths: Lengths of each document for the keys and values, usually for prefilling
+
+        Note:
+            What is the sequence stacked format? When assembling batches of inputs, we
+            take multiple sequences and stack them together to form 1 large sequence. We then
+            use masking to ensure that the attention scores are only applied to tokens within
+            the same document.
+
+            This also adds a region to the beginning so that every token attends to the latent
+            keys and values.
+
+        Example:
+
+        - Square mask + latents
+          doc_mask               lengths
+          0 1 2 a a b b b c c    2 3 2
+        a 1 1 1 1 0 0 0 0 0 0
+        a 1 1 1 1 1 0 0 0 0 0
+        b 1 1 1 0 0 1 0 0 0 0
+        b 1 1 1 0 0 1 1 0 0 0
+        b 1 1 1 0 0 1 1 1 0 0
+        c 1 1 1 0 0 0 0 0 1 0
+        c 1 1 1 0 0 0 0 0 1 1
+
+        - Rectangular (prefill) mask + latents
+          doc_mask                     lengths  kv_lengths
+          0 1 2 a a - b b b - c c -    2 3 2    3 4 3
+        a 1 1 1 1 0 0 0 0 0 0 0 0 0
+        a 1 1 1 1 1 0 0 0 0 0 0 0 0
+        b 1 1 1 0 0 0 1 0 0 0 0 0 0
+        b 1 1 1 0 0 0 1 1 0 0 0 0 0
+        b 1 1 1 0 0 0 1 1 1 0 0 0 0
+        c 1 1 1 0 0 0 0 0 0 0 1 0 0
+        c 1 1 1 0 0 0 0 0 0 0 1 1 0
+
+        """
+        kv_lengths = kv_lengths if kv_lengths is not None else lengths
+        q_document_id, q_token_id = lengths_to_local_ids(lengths)
+        kv_document_id, kv_token_id = lengths_to_local_ids(kv_lengths)
+        q_max_idx = lengths.sum() - 1
+        kv_max_idx = kv_lengths.sum() - 1 + self.n_latent_kv
+
+        def doc_mask_mod(
+            b: torch.Tensor, h: torch.Tensor, q_idx: torch.Tensor, kv_idx: torch.Tensor
+        ) -> torch.Tensor:
+            latent_kv_mask = kv_idx < self.n_latent_kv
+
+            valid_idx_mask = (q_idx <= q_max_idx) & (kv_idx <= kv_max_idx)
+
+            q_idx_clamped = torch.minimum(q_max_idx, q_idx)
+            kv_idx_clamped = torch.maximum(torch.minimum(kv_max_idx, kv_idx), torch.tensor(self.n_latent_kv, device=kv_idx.device)) - self.n_latent_kv  # Shift right
+
+            same_doc = q_document_id[q_idx_clamped] == kv_document_id[kv_idx_clamped]
+
+            q_logical = q_token_id[q_idx_clamped]
+            kv_logical = kv_token_id[kv_idx_clamped]
+            inner_mask = mask_mod(b, h, q_logical, kv_logical)
+
+            return ((same_doc & inner_mask) | latent_kv_mask) & valid_idx_mask
+
+        return doc_mask_mod
+
+    def create_block_mask(
+        self: Self,
+        lengths: torch.Tensor,
+        kv_lengths: torch.Tensor | None = None,
+        mask_mod: _mask_mod_signature = causal_mask,
+    ) -> BlockMask:
+        kv_lengths = kv_lengths if kv_lengths is not None else lengths
+
+        doc_mask_mod = self.generate_doc_mask_mod(mask_mod, lengths, kv_lengths)
+        return create_block_mask(
+            doc_mask_mod, 1, None, lengths.sum(), kv_lengths.sum().item() + self.n_latent_kv
+        )
+
+    def latent_causal_mask(
+        self: Self,
+        b: torch.Tensor | None,
+        h: torch.Tensor | None,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        latent_adjusted_kv_idx = torch.maximum(kv_idx - self.n_latent_kv, torch.tensor(0, device=kv_idx.device))
+
+        return q_idx >= latent_adjusted_kv_idx
+
+    def create_causal_mask(
+        self: Self,
+        seqlen: int,
+        attn_impl: AttentionImpl,
+        sliding_window: int | None,
+        device: torch.device,
+    ) -> BlockMask | AttentionBias | torch.Tensor | str:
+        match attn_impl, sliding_window, self.n_latent_kv:
+            case AttentionImpl.XFORMERS, None, _:
+                return fmha.attn_bias.LowerTriangularFromBottomRightMask()
+            case AttentionImpl.XFORMERS, _, 0:
+                return fmha.attn_bias.LocalAttentionFromBottomRightMask(
+                    window_left=sliding_window - 1, window_right=0
+                )
+            case AttentionImpl.SDPA, None, 0:
+                return "causal"
+            case AttentionImpl.SDPA, None, _:
+                q_idx = torch.arange(seqlen, device=device).view(-1, 1)
+                kv_idx = torch.arange(seqlen + self.n_latent_kv, device=device).view(1, -1)
+
+                return self.latent_causal_mask(None, None, q_idx, kv_idx)
+            case AttentionImpl.FLEX_ATTENTION, None, 0:
+                return create_block_mask(causal_mask, None, None, seqlen, seqlen)
+            case AttentionImpl.FLEX_ATTENTION, None, _:
+                return create_block_mask(self.latent_causal_mask, None, None, seqlen, seqlen + self.n_latent_kv)
+            case _, _, _:
+                raise NotImplementedError(
+                    f"Attention {attn_impl} with {sliding_window} sliding window not implemented"
+                )
+
+    def create_generation_mask(
+        self: Self,
+        current_doc_id: torch.Tensor,
+        current_token_id: torch.Tensor,
+        padded_doc_id: torch.Tensor,
+        padded_token_id: torch.Tensor,
+        device: torch.device,
+        attn_impl: AttentionImpl = AttentionImpl.SDPA,
+        sliding_window: int | None = None,
+    ) -> torch.Tensor:
+        # Since we're doing generation with multiple sequences at once
+        # we need to ignore tokens and cache entries from other sequences
+        # or in the future.
+        # Example mask :
+        #                     keys
+        #                012abc--defg--
+        #   queries    c 11111100000000
+        #              g 11100000111100
+
+        # mask shape : (n_seqs, cache_size)
+
+        assert attn_impl == AttentionImpl.SDPA, "Only SDPA is supported for generation mask"
+        assert sliding_window is None, "Sliding window is not supported for generation mask"
+
+        doc_mask = current_doc_id.view(-1, 1) == padded_doc_id.view(1, -1)
+        causal_mask = current_token_id.view(-1, 1) >= padded_token_id.view(1, -1)
+        mask = doc_mask & causal_mask
+
+        mask_with_latents = torch.cat(
+            [
+                torch.ones(mask.shape[0], self.n_latent_kv, device=device, dtype=torch.bool),
+                mask,
+            ],
+            dim=1,
+        )
+
+        return mask_with_latents
 
     INIT_STD_FACTOR_FNS = {
         InitStdFactor.CURRENT_DEPTH: lambda self, depth: (2 * (depth + 1)) ** 0.5,
