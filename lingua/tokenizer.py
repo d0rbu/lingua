@@ -159,6 +159,7 @@ class TikTokenTokenizer(Tokenizer):
 
         self.bos_id: int = self.tkt_model.encode_single_token("<|begin_of_text|>")
         self.eos_id: int = self.tkt_model.encode_single_token("<|end_of_text|>")
+        self.pad_id: int = self.tkt_model.encode_single_token("<|fim_pad|>")
 
         self.n_words: int = self.tkt_model.n_vocab
 
