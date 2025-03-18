@@ -1,9 +1,10 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 import time
-from typing import List, Optional
+from typing import List, Optional, Self
 
 import torch
 from torch import nn
@@ -11,21 +12,22 @@ from tqdm import tqdm
 
 from omegaconf import OmegaConf
 from torch.nn import functional as F
-import xformers
 
 from apps.main.transformer import LMTransformer, LMTransformerArgs
 from lingua.args import dataclass_from_dict
 from lingua.checkpoint import CONSOLIDATED_CKPT_NAME
+from lingua.data import QA_PROMPT, IGNORE_INDEX
 from lingua.tokenizer import Tokenizer, build_tokenizer
 from lingua.transformer import (
     Attention,
     causal_mask,
-    generate_doc_mask_mod,
     lengths_to_local_ids,
     lengths_to_start_ids,
     AttentionImpl,
 )
-from torch.nn.attention.flex_attention import create_block_mask
+
+
+torch._dynamo.config.suppress_errors = True
 
 
 def sample_top_p(probs: torch.Tensor, p: float) -> torch.Tensor:
@@ -140,7 +142,7 @@ class PackedCausalTransformerGeneratorArgs:
 
 class PackedCausalTransformerGenerator:
     def __init__(
-        self,
+        self: Self,
         cfg: PackedCausalTransformerGeneratorArgs,
         model: nn.Module,
         tokenizer: Tokenizer,
@@ -218,8 +220,12 @@ class PackedCausalTransformerGenerator:
         # We will generate max_gen_len for each document
         padded_lengths = lengths + self.max_gen_len
         max_tokens = self.max_tokens or padded_lengths.sum().item()
+
         # The last document might have more padding to fill up to max_tokens
         padded_lengths[-1] += max_tokens - padded_lengths.sum()
+
+        assert torch.all(padded_lengths > 0), "Padded lengths must be positive. Is max_tokens too small?"
+        assert padded_lengths.sum().item() == max_tokens, "Sum of padded lengths must be equal to max_tokens"
 
         # This is the start index in the cache for each document
         self.padded_doc_start = lengths_to_start_ids(padded_lengths)
@@ -237,21 +243,18 @@ class PackedCausalTransformerGenerator:
         self.clear_cache(prefill_offset)
 
         # The prefilling mask looks like the following for
-        # the two packed sequences ab and 123 : ab123
+        # the two packed sequences ab and cde : abcde
         # Where spaces are empty cache positions
         #                 keys
-        #                ab---123---
-        #   queries    a 10000000000
-        #              b 11000000000
-        #              1 00000100000
-        #              2 00000110000
-        #              3 00000111000
+        #                012ab---cde---
+        #   queries    a 11110000000000
+        #              b 11111000000000
+        #              c 11100000100000
+        #              d 11100000110000
+        #              e 11100000111000
         # We make sure to skip the empty cache positions
         # and only attend to positions within the same sequence
-        doc_mask_mod = generate_doc_mask_mod(causal_mask, lengths, padded_lengths)
-        self.prefill_mask = create_block_mask(
-            doc_mask_mod, 1, None, lengths.sum(), max_tokens
-        )
+        self.prefill_mask = self.model.create_block_mask(lengths, padded_lengths)
 
         # This creates the prefilling token ids which look like
         # the following for the packed sequence abcdefg1234
@@ -298,19 +301,15 @@ class PackedCausalTransformerGenerator:
         return prefill_out
 
     def generate_next_token(self, current_token):
-        # Since we're doing generation with multiple sequences at once
-        # we need to ignore tokens and cache entries from other sequences
-        # or in the future.
-        # Example mask :
-        #                  keys
-        #                abc--1234--
-        #   queries    c 11100000000
-        #              4 00000111100
+        mask = self.model.create_generation_mask(
+            self.current_doc_id,
+            self.current_tok_id,
+            self.padded_doc_id,
+            self.padded_tok_id,
+            device=current_token.device,
+            attn_impl=AttentionImpl.SDPA,
+        )
 
-        # mask shape : (n_seqs, cache_size)
-        doc_mask = self.current_doc_id.unsqueeze(1) == self.padded_doc_id.unsqueeze(0)
-        caus_mask = self.current_tok_id.unsqueeze(1) >= self.padded_tok_id.unsqueeze(0)
-        mask = doc_mask & caus_mask
         out = self.model.forward(
             current_token,
             tok_idx=self.current_tok_id,  # n_seqs
@@ -318,13 +317,15 @@ class PackedCausalTransformerGenerator:
             attn_impl=AttentionImpl.SDPA,
         )
         self.current_tok_id += 1
+
         return out
 
     @torch.inference_mode()
-    def generate(self, prompts):
+    def generate(self: Self, prompts: List[str]):
         # Tokenize
+        tokenizer_has_bos = self.tokenizer.tokenizer.bos_token is not None
         prompts = [
-            self.tokenizer.encode(p, add_bos=True, add_eos=False) for p in prompts
+            self.tokenizer.encode(p, add_bos=tokenizer_has_bos, add_eos=False) for p in prompts
         ]
         # Truncate
         max_seqlen = (
@@ -400,6 +401,49 @@ class PackedCausalTransformerGenerator:
 
         return generation, loglikelihood, greedy
 
+    @torch.inference_mode()
+    def qa_loglikelihoods(self: Self, qa_prompts: list[tuple[str, str]]) -> tuple[list[torch.Tensor], list[int], list[int]]:
+        """
+        Compute the loglikelihood of a question-answer pair.
+
+        Args:
+            qa_prompts: List of tuples of question-answer pairs.
+
+        Returns:
+            loglikelihoods: List of loglikelihoods for each question-answer pair.
+            answer_token_lengths: List of lengths of the answer tokens.
+            answer_lengths: List of lengths of the answer strings.
+        """
+        loglikelihoods = []
+        answer_token_lengths = []
+        answer_lengths = []
+        for question, answer in qa_prompts:
+            formatted_question = QA_PROMPT.format(instruction=question)
+            example = f"{formatted_question}{answer}"
+
+            question_tokens = self.tokenizer.encode(formatted_question, add_bos=False, add_eos=False)
+            example_tokens = self.tokenizer.encode(example, add_bos=False, add_eos=False)
+            labels = deepcopy(example_tokens)
+
+            # Properly shift the tokens/labels to have a causal LM objective
+            tokens = example_tokens[:-1]
+            labels = labels[1:]
+
+            # Mask out the question tokens in the labels
+            num_question_output_tokens = len(question_tokens)
+            labels[:num_question_output_tokens] = [IGNORE_INDEX] * num_question_output_tokens
+
+            tokens = torch.tensor(tokens, dtype=torch.long, device=self.device).unsqueeze(0)
+            labels = torch.tensor(labels, dtype=torch.long, device=self.device).unsqueeze(0)
+
+            logits = self.model(tokens)
+            loglikelihood = -F.cross_entropy(logits.view(-1, logits.size(-1)), labels.view(-1), reduction="none").cpu()
+            loglikelihoods.append(loglikelihood)
+
+            answer_token_lengths.append(len(example_tokens) - len(question_tokens))
+            answer_lengths.append(len(answer))
+
+        return loglikelihoods, answer_token_lengths, answer_lengths
 
 def load_consolidated_model_and_tokenizer(
     consolidated_path,
@@ -417,7 +461,7 @@ def load_consolidated_model_and_tokenizer(
     tokenizer = build_tokenizer(config.data.tokenizer.name, config.data.tokenizer.path)
     model = model_cls(model_args)
     st_dict = torch.load(ckpt_path / CONSOLIDATED_CKPT_NAME, weights_only=True)
-    model.load_state_dict(st_dict["model"])
+    model.load_state_dict(st_dict["model"] if "model" in st_dict else st_dict)
     model = model.cuda().eval()
     for param in model.parameters():
         param.data = param.data.to(dtype=param_dtype)

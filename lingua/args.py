@@ -8,6 +8,7 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 
 from lingua.optim import SchedulerType
 from lingua.transformer import InitStdFactor, RoPEType
+from lingua.data import DatasetType
 from lingua.tokenizer import TokenizerType
 
 logger = logging.getLogger()
@@ -44,6 +45,7 @@ def flatten_dict(dictionary: dict, parent_key="", sep="_"):
 ENCODED_ENUMS = {
     SchedulerType,
     InitStdFactor,
+    DatasetType,
     RoPEType,
     TokenizerType,
 }

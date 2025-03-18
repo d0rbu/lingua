@@ -5,6 +5,7 @@ import json
 import logging
 import os
 from copy import deepcopy
+from enum import Enum
 from dataclasses import dataclass, field
 from functools import partial
 from multiprocessing import Event, Process, Queue
@@ -99,27 +100,34 @@ class MultiChoiceState(TypedDict):
 
 
 class TokenizerState(TypedDict):
-    it_state: Any
+    it_state: MultiChoiceState
     name: str
     add_bos: bool
     add_eos: bool
     path: Optional[str]
 
 
-class PackTokensState(TypedDict):
-    """Represents the current state of a packing iterator.
+class PackAndPadTokensState(TypedDict):
+    """Represents the current state of a packing and padding iterator.
 
     Attributes:
         start_token: int index to start reading from in the current sequence
         output_seq_len: int Length of sequences to output
-        n_views: dict int Number of views to output. Each view is the same sequence but shifted by 1 from the previous
+        n_views: int Number of views to output. Each view is the same sequence but shifted by 1 from the previous
+        pad_id: int The id of the padding token
     """
 
     start_token: int
-    it_state: Any
+    it_state: TokenizerState
     output_seq_len: int
     n_views: int
     seq_len: int
+    pad_id: int
+
+
+class DatasetType(Enum):
+    PRETRAIN = "pretrain"
+    QA = "qa"
 
 
 class PrefetchState(TypedDict):
@@ -131,11 +139,12 @@ class PrefetchState(TypedDict):
         rng_state: dict numpy bit generator state used to resume rng
     """
 
-    it_state: Any
+    it_state: PackAndPadTokensState
     seq_idx: int
     rng_state: Dict[str, Any]
     prefetch_size: int
     batch_size: int
+    dataset_type: DatasetType
 
 
 def read_jsonl(
@@ -172,7 +181,7 @@ def read_jsonl(
         offset=offset,
         current_iter=current_iter,
     )
-    with open(file_path, "r") as file:
+    with open(file_path, "r", encoding="utf-8") as file:
         file.seek(position)
         while line := file.readline():
             current_line += 1
@@ -220,14 +229,15 @@ def tokenize(
 
     Parameters:
     - iterator: An iterable of (content, state) pairs where content is a dict with a 'text' or 'content' key.
-    - tokenizer: Tokenizer object with an `encode` method to convert text to tokens, supporting `add_bos` and `add_eos`.
     - add_bos (bool): Flag to add a beginning-of-sequence token.
     - add_eos (bool): Flag to add an end-of-sequence token.
+    - tokenizer_type (str): The type of tokenizer to use.
+    - tokenizer_path (Optional[str]): The path to the tokenizer model.
 
     Yields:
     - (tokens, state) pairs, where `tokens` is a list of tokenized text, and `state` is the original state from the iterator.
     """
-    tokenizer = build_tokenizer(name=tokenizer_type, path=tokenizer_path)
+    tokenizer = build_tokenizer(type=tokenizer_type, path=tokenizer_path)
     for content, state in iterator:
         assert "text" in content or "content" in content, (
             "JSON line must contain either text or content key"
@@ -241,6 +251,74 @@ def tokenize(
                 it_state=state,
                 add_bos=add_bos,
                 add_eos=add_eos,
+                name=tokenizer_type,
+                path=tokenizer_path,
+            ),
+        )
+
+
+QA_PROMPT = (
+    "Below is an instruction that describes a task. "
+    "Write a response that appropriately completes the request.\n\n"
+    "### Instruction:\n{instruction}\n\n### Response:"
+)
+IGNORE_INDEX = -100
+
+
+def tokenize_qa(
+    iterator: Iterator,
+    tokenizer_type: str,
+    tokenizer_path: Optional[str] = None,
+) -> Iterator:
+    """
+    Tokenizes qa pairs from an iterator of content-state pairs using a specified tokenizer.
+
+    Parameters:
+    - iterator: An iterable of (content, state) pairs where content is a dict with 'question' and 'context' keys.
+    - tokenizer_type (str): The type of tokenizer to use.
+    - tokenizer_path (Optional[str]): The path to the tokenizer model.
+
+    Yields:
+    - (tokens, labels, state) triples, where `tokens` is a list of tokenized text, `labels` is a list of labels
+      (with question tokens masked out), and `state` is the original state from the iterator.
+    """
+    tokenizer = build_tokenizer(type=tokenizer_type, path=tokenizer_path)
+    for content, state in iterator:
+        assert "question" in content or "query" in content, (
+            "JSON line must contain either question or query key"
+        )
+        assert "answer" in content or "response" in content, (
+            "JSON line must contain either answer or response key"
+        )
+
+        question_key = "question" if "question" in content else "query"
+        answer_key = "answer" if "answer" in content else "response"
+
+        question = content[question_key]
+        answer = content[answer_key]
+
+        formatted_question = QA_PROMPT.format(instruction=question)
+        example = f"{formatted_question}{answer}"
+
+        question_tokens = tokenizer.encode(formatted_question, add_bos=False, add_eos=False)
+        tokens = tokenizer.encode(example, add_bos=False, add_eos=False)
+        labels = deepcopy(tokens)
+
+        # Properly shift the tokens/labels to have a causal LM objective
+        tokens = tokens[:-1]
+        labels = labels[1:]
+
+        # Mask out the question tokens in the labels
+        num_question_output_tokens = len(question_tokens)
+        labels[:num_question_output_tokens] = [IGNORE_INDEX] * num_question_output_tokens
+
+        yield (
+            tokens,
+            labels,
+            TokenizerState(
+                it_state=state,
+                add_bos=False,
+                add_eos=False,
                 name=tokenizer_type,
                 path=tokenizer_path,
             ),
@@ -295,8 +373,8 @@ def choose_source(
 
 def get_empty_buffer_state(
     start_token: int,
-    states: list[PackTokensState],
-) -> PackTokensState:
+    states: list[PackAndPadTokensState],
+) -> PackAndPadTokensState:
     """
     Calculates the state to resume iteration after the buffer is cleared.
 
@@ -323,7 +401,7 @@ def get_empty_buffer_state(
 
 def pack_tokens(
     iterator: Iterator,
-    empty_buffer_state: PackTokensState,
+    empty_buffer_state: PackAndPadTokensState,
 ) -> Iterator:
     """
     Iterates over tokens, packing them into chunks.
@@ -341,7 +419,7 @@ def pack_tokens(
 
     Yields:
     - numpy.ndarray: An array of shape `(output_seq_len, n_views)` containing the packed tokens.
-    - PackTokensState: The state required to resume packing tokens from where the last returned chunk.
+    - PackAndPadTokensState: The state required to resume packing tokens from where the last returned chunk.
 
     The function handles the complexity of determining the correct state for resuming iteration after the buffer is cleared, ensuring seamless continuation of token sequences.
     """
@@ -366,7 +444,7 @@ def pack_tokens(
             start_token = end_token
 
             states.append(
-                PackTokensState(
+                PackAndPadTokensState(
                     start_token=start_token,
                     seq_len=seq_len,
                     it_state=previous_state,
@@ -397,12 +475,64 @@ def pack_tokens(
                 previous_state = state
 
 
+def pad_tokens(
+    iterator: Iterator,
+    empty_buffer_state: PackAndPadTokensState,
+) -> Iterator:
+    """
+    Iterates over sequences of tokens, padding them so as to not split nor truncate sequences.
+
+    Parameters:
+    - iterator: An iterator that yields triples of (tokens, labels, state), where tokens is a 1D sequence of tokens, labels is a list of labels, and state contains all necessary information to resume iterator from current position.
+    - empty_buffer_state: State of the iterator currently.
+
+    Yields:
+    - numpy.ndarray: An array of shape `(output_seq_len, 2)` containing the padded tokens and labels.
+    - PackAndPadTokensState: The state required to resume packing tokens from where the last returned chunk. Unused
+    """
+
+    seq_len = empty_buffer_state["output_seq_len"]
+    pad_id = empty_buffer_state["pad_id"]
+
+    for tokens, labels, state in iterator:
+        assert len(tokens) == len(labels), (
+            f"Tokens and labels should have the same length. Got {len(tokens)} and {len(labels)}"
+        )
+
+        padding_space = seq_len - len(tokens)
+        if padding_space < 0:
+            raise RuntimeError(
+                "Sequence too long for configured sequence length. Increase seq_len"
+            )
+
+        # We pad to the desired length
+        token_buffer = np.pad(
+            tokens, (0, padding_space), "constant", constant_values=pad_id
+        )
+        label_buffer = np.pad(
+            labels, (0, padding_space), "constant", constant_values=IGNORE_INDEX
+        )
+
+        out = np.stack([token_buffer, label_buffer], axis=1)
+        yield (
+            out,
+            PackAndPadTokensState(
+                start_token=empty_buffer_state["start_token"],
+                it_state=state,
+                output_seq_len=empty_buffer_state["output_seq_len"],
+                n_views=empty_buffer_state["n_views"],
+                pad_id=empty_buffer_state["pad_id"],
+            ),
+        )
+
+
 def batch_and_shuffle_prefetched_sequences(
     data_loader: Iterator,
     batch_size: int,
     prefetch_size: int,
     seq_len: int,
     n_views: int,
+    dataset_type: DatasetType,
     state: PrefetchState,
 ) -> Iterator:
     """
@@ -412,6 +542,8 @@ def batch_and_shuffle_prefetched_sequences(
 
     It uses a prefetch buffer to store batches in advance and shuffles them, the prefetch buffer is similar to `reservoir sampling`,
     but by block to preserve a smooth, easy and deterministic reloading. To ensure more uniform sequence sampling -> prefetch_size * batch_size * seq_len >> max_document_seqlength.
+
+    It also truncates the batches if they end with pad tokens to help with training efficiency.
 
     Parameters:
     - iterator: An iterator that yields pairs of (sequence, state), where is a random sequence sampled from a corpus (as done by pack_tokens for example).
@@ -424,6 +556,8 @@ def batch_and_shuffle_prefetched_sequences(
     - numpy.ndarray: An array of shape `(batch_size, seq_len, n_views)` containing the packed tokens.
     - PrefetchState: The state required to resume prefetched batch. Contains also the internal of iterator.
     """
+    pad_id = state["it_state"]["pad_id"]
+
     prefetch_buffer = -1 * np.ones(
         (prefetch_size * batch_size, seq_len, n_views), dtype=int
     )
@@ -457,9 +591,24 @@ def batch_and_shuffle_prefetched_sequences(
             rng_state=_rng_state,
             batch_size=batch_size,
             prefetch_size=prefetch_size,
+            dataset_type=dataset_type,
         )
 
-        yield prefetch_buffer[idx * batch_size : (idx + 1) * batch_size].copy(), state
+        current_batch = prefetch_buffer[idx * batch_size : (idx + 1) * batch_size].copy()
+
+        # We truncate the batch if it ends with pad tokens
+        inputs = current_batch[:, :, 0]  # B S
+        padding_mask = inputs == pad_id
+        pad_tokens_by_tok_idx = padding_mask.sum(axis=0)  # S
+
+        # Mask for tokens that are pad tokens in all sequences
+        full_pad_token_mask = pad_tokens_by_tok_idx == batch_size
+
+        if full_pad_token_mask.any():
+            first_full_pad_idx = full_pad_token_mask.argmax()
+            current_batch = current_batch[:, :first_full_pad_idx]
+
+        yield current_batch, state
 
         for i in range(batch_size):
             prefetch_buffer[idx * batch_size + i], pack_state = next(data_loader)
@@ -562,6 +711,7 @@ def init_state(
     add_eos: bool,
     tokenizer_name: str,
     tokenizer_path: Optional[str] = None,
+    dataset_type: DatasetType = DatasetType.PRETRAIN,
     file_pattern: str = TRAIN_DATA_FILE_PATTERN,
 ) -> PrefetchState:
     multi_choice_state = init_choice_state(
@@ -579,12 +729,14 @@ def init_state(
         name=tokenizer_name,
         path=tokenizer_path,
     )
-    pack_state = PackTokensState(
+    tokenizer = build_tokenizer(type=tokenizer_name, path=tokenizer_path)
+    pack_state = PackAndPadTokensState(
         start_token=0,
         it_state=tokenizer_state,
         output_seq_len=seq_len,
         n_views=n_views,
         seq_len=0,
+        pad_id=tokenizer.pad_id,
     )
 
     prefetch_rng_state = np.random.default_rng(
@@ -597,6 +749,7 @@ def init_state(
         rng_state=prefetch_rng_state,
         batch_size=batch_size,
         prefetch_size=prefetch_size,
+        dataset_type=dataset_type,
     )
 
 
@@ -619,9 +772,11 @@ def setup_sources(multi_state: MultiChoiceState) -> Dict[str, Iterator]:
 def build_dataloader(
     state: PrefetchState,
 ) -> Iterator:
-    pack_state = state["it_state"]
-    tokenizer_state = pack_state["it_state"]
+    pack_and_pad_state = state["it_state"]
+    tokenizer_state = pack_and_pad_state["it_state"]
     multi_state = tokenizer_state["it_state"]
+
+    dataset_type = state["dataset_type"]
 
     path_to_iter = setup_sources(multi_state)
     data_it = choose_source(
@@ -631,25 +786,38 @@ def build_dataloader(
         sources=multi_state["sources"],
         rng_state=multi_state["rng_state"],
     )
-    data_it = tokenize(
-        data_it,
-        tokenizer_state["add_bos"],
-        tokenizer_state["add_eos"],
-        tokenizer_state["name"],
-        tokenizer_state["path"],
-    )
 
-    data_it = pack_tokens(
-        data_it,
-        pack_state,
-    )
+    match dataset_type:
+        case DatasetType.PRETRAIN:
+            data_it = tokenize(
+                data_it,
+                tokenizer_state["add_bos"],
+                tokenizer_state["add_eos"],
+                tokenizer_state["name"],
+                tokenizer_state["path"],
+            )
+            data_it = pack_tokens(
+                data_it,
+                pack_and_pad_state,
+            )
+        case DatasetType.QA:
+            data_it = tokenize_qa(
+                data_it,
+                tokenizer_state["name"],
+                tokenizer_state["path"],
+            )
+            data_it = pad_tokens(
+                data_it,
+                pack_and_pad_state,
+            )
 
     data_it = batch_and_shuffle_prefetched_sequences(
         data_loader=data_it,
-        seq_len=pack_state["output_seq_len"],
-        n_views=pack_state["n_views"],
+        seq_len=pack_and_pad_state["output_seq_len"],
+        n_views=pack_and_pad_state["n_views"],
         batch_size=state["batch_size"],
         prefetch_size=state["prefetch_size"],
+        dataset_type=dataset_type,
         state=state,
     )
     yield data_it
@@ -737,6 +905,7 @@ class DataArgs:
     load_async: bool = True
     prefetch_size: int = 64
     tokenizer: TokenizerArgs = field(default_factory=TokenizerArgs)
+    dataset_type: DatasetType = DatasetType.PRETRAIN
 
 
 def init_dataloader_state_from_args(
@@ -758,6 +927,7 @@ def init_dataloader_state_from_args(
         tokenizer_path=args.tokenizer.path,
         add_bos=args.add_bos,
         add_eos=args.add_eos,
+        dataset_type=args.dataset_type,
     )
 
 

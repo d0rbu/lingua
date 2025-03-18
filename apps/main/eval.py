@@ -230,21 +230,45 @@ def eval_on_val(generator, val_args: ValidationArgs, train_cfg):
         texts = []
         logger.info(f"Running validation on {src}...")
 
+        is_pretraining_data = None
         for step, (content, state) in enumerate(jsonl_iterator):
             if state['current_iter'] > 0 or (val_args.max_steps is not None and step >= val_args.max_steps):
                 break
+            
+            if is_pretraining_data is None:
+                is_pretraining_data = "text" in content or "content" in content
 
-            content_key = "text" if ("text" in content) else "content"
-            texts.append(content[content_key])
+            if is_pretraining_data:
+                content_key = "text" if ("text" in content) else "content"
+                texts.append(content[content_key])
+            else:  # is QA data
+                question_key = "question" if "question" in content else "query"
+                answer_key = "answer" if "answer" in content else "response"
+                texts.append((content[question_key], content[answer_key]))
 
-        _, loglikelihood, _ = generator.generate(texts)
+        answer_token_lengths = None
+        answer_lengths = None
+        if is_pretraining_data or is_pretraining_data is None:
+            _, loglikelihood, _ = generator.generate(texts)
+        else:
+            loglikelihood, answer_token_lengths, answer_lengths = generator.qa_loglikelihoods(texts)
 
         metrics = defaultdict(list)
         for i, ll in enumerate(loglikelihood):
+            if answer_lengths is None:
+                token_length = len(ll)
+            else:
+                token_length = answer_token_lengths[i]
+
+            if answer_token_lengths is None:
+                answer_length = len(texts[i])
+            else:
+                answer_length = answer_lengths[i]
+
             tmp = ll.sum().item()
             metrics['nll'].append(tmp)
-            metrics['nll_per_token'].append(tmp / len(ll))
-            metrics['nll_per_char'].append(tmp / len(texts[i]))
+            metrics['nll_per_token'].append(tmp / token_length)
+            metrics['nll_per_char'].append(tmp / answer_length)
 
             metrics['avg_seqlen'].append(len(ll))
 
