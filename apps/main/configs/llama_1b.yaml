@@ -1,0 +1,98 @@
+#python -m lingua.stool config=apps/main/configs/llama2_7B.yaml nodes=32 account=fair_amaia_cw_codegen qos=lowest
+dump_dir: out/llama_1b
+name: llama_1b
+steps: 25_000
+probe_freq: null
+seed: 0
+grad_acc_steps: 32
+
+optim:
+  lr: 3e-3
+  weight_decay: 0.033
+  warmup: 1_000
+  lr_min_ratio: 0.000001
+  clip: 1.0
+
+distributed:
+  fsdp_type: full_shard
+  compile: true
+  model_dtype: bf16
+  matmul_allow_tf32: false
+  selective_activation_checkpointing: false
+  tp_size: 1
+
+model:
+  dim: 2048
+  n_layers: 25
+  n_heads: 16
+  max_seqlen: 1024
+  rope_theta: 500_000
+  multiple_of: 256
+  vocab_size: 128_256
+  weight_tying: true
+
+data:
+  root_dir: data
+  sources:
+    fineweb_edu_100bt_shuffled: 100.0
+  batch_size: 8
+  prefetch_size: 2720
+  seq_len: 2048
+  n_views: 2
+  load_async: true
+  add_bos: true
+  add_eos: true
+  tokenizer:
+    name: tiktoken
+    path: tokenizers/original/tokenizer.model
+
+profiling:
+  run: false
+
+checkpoint:
+  dump:
+    every: 100
+    keep_last: 0
+  eval:
+    every: 200
+    keep_last: -1
+
+logging:
+  freq: 1
+  wandb:
+    dir: out/llama_1b/wandb
+    project: lingua
+    entity: d0rb
+    tags:
+      - llama
+      - size=1b
+    resume: allow
+    force: true
+
+eval:
+  # harness:
+  #   tasks:
+  #     - hellaswag
+  #     - task: boolq
+  #       dataset_kwargs:
+  #         trust_remote_code: true
+  #     - piqa
+  #     - task: social_iqa
+  #       dataset_kwargs:
+  #         trust_remote_code: true
+  #     - winogrande
+  #     - openbookqa
+  #     - arc_easy
+  #     - arc_challenge
+  #     - race
+  #     - commonsense_qa
+  #     - copa
+  #     # - coqa
+  #     # - task: nq_open
+  #     #   num_fewshot: 5
+  #     # - triviaqa
+  validation:
+    max_steps: 1000
+  generator:
+    max_tokens: 16384
+    dtype: bf16
