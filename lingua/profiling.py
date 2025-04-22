@@ -12,7 +12,6 @@ from typing import Self, Generator
 from torch.profiler.profiler import profile
 import xformers.profiler
 from xformers.profiler import (
-    _Profiler,
     MemSnapshotsProfiler,
     PyTorchProfiler,
 )
@@ -67,7 +66,7 @@ def perfetto_to_html(json_filepath: Path, html_filepath: Path) -> None:
 
 
 class PyTorchProfilerWandb(PyTorchProfiler):
-    def __init__(self: Self, main_profiler: _Profiler) -> None:
+    def __init__(self: Self, main_profiler) -> None:
         self.main_profiler = main_profiler
         self.num_steps = 0
         self.pytorch_profiler = torch.profiler.profile(
