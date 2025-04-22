@@ -34,7 +34,7 @@ model:
 data:
   root_dir: data
   sources:
-    fineweb_edu_100bt_shuffled: 100.0
+    fineweb_edu_10bt_shuffled: 100.0
   batch_size: 2
   prefetch_size: 4096
   seq_len: 1024

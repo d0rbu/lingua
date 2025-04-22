@@ -4,7 +4,7 @@ name: llama_1b
 steps: 25_000
 probe_freq: null
 seed: 0
-grad_acc_steps: 32
+grad_acc_steps: 256
 
 optim:
   lr: 3e-3
@@ -34,8 +34,8 @@ model:
 data:
   root_dir: data
   sources:
-    fineweb_edu_100bt_shuffled: 100.0
-  batch_size: 8
+    fineweb_edu_10bt_shuffled: 100.0
+  batch_size: 1
   prefetch_size: 2720
   seq_len: 2048
   n_views: 2

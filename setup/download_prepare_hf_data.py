@@ -28,6 +28,14 @@ DATASET_CONFIGS = {
         repo_id="HuggingFaceFW/fineweb-edu",
         allow_patterns="sample/10BT/*",
     ),
+    "fineweb_edu_100bt": DatasetConfig(
+        repo_id="HuggingFaceFW/fineweb-edu",
+        allow_patterns="sample/100BT/*",
+    ),
+    "fineweb_edu_350bt": DatasetConfig(
+        repo_id="HuggingFaceFW/fineweb-edu",
+        allow_patterns="sample/350BT/*",
+    ),
     "dclm_baseline_1.0": DatasetConfig(
         repo_id="mlfoundations/dclm-baseline-1.0",
         orig_extension=".jsonl.zst",
