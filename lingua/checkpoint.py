@@ -279,12 +279,13 @@ class CheckpointManager:
     ) -> bool:
         dp_rank, _ = self._get_dp_tp_mesh(device_mesh)
         # Loading tries to load the provided path, if not available then the last saved step and finally from the init path
+        init_ckpt_path = self.init_ckpt_path and Path(self.init_ckpt_path)
         path = (
             path
             or self.get_last_step_path(dp_rank=dp_rank)
-            or Path(self.init_ckpt_path)
+            or init_ckpt_path
         )
-        loading_from_init = path == Path(self.init_ckpt_path)
+        loading_from_init = path == init_ckpt_path
 
         if path is None:
             logger.info("No checkpoint found, skipping load")

@@ -67,6 +67,7 @@ class BaseTransformerArgs:
     norm_eps: float = 1e-5
 
     rope_theta: float = 10000.0
+    rope_scaling: RoPEScalingArgs = field(default_factory=RoPEScalingArgs)
 
     init_base_std: float | None = None
     init_std_factor: InitStdFactor = InitStdFactor.DISABLED
