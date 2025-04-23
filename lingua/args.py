@@ -2,7 +2,7 @@
 
 import logging
 import json
-from typing import Type, TypeVar
+from typing import Type, TypeVar, Any, Callable
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
 
@@ -68,27 +68,29 @@ def enum_decoder(obj):
         return getattr(enum_class, member)
     return obj
 
+def apply_object_hook(
+    data: DictConfig | ListConfig | dict | list | Any,
+    hook: Callable,
+) -> DictConfig | ListConfig | Any:
+    decoded_data = hook(data) if isinstance(data, (DictConfig, dict)) else data
+
+    if isinstance(decoded_data, (DictConfig, dict)):
+        return OmegaConf.create({k: apply_object_hook(v, hook) for k, v in decoded_data.items()})
+    elif isinstance(decoded_data, (ListConfig, list)):
+        return OmegaConf.create([apply_object_hook(item, hook) for item in decoded_data])
+    else:
+        return decoded_data
 
 def dataclass_from_dict(cls: Type[T], data: dict, strict: bool = True) -> T:
     """
     Converts a dictionary to a dataclass instance, recursively for nested structures.
     """
+    enum_decoded_data = apply_object_hook(data, enum_decoder)  # Decode enums if present
+
     base = OmegaConf.structured(cls())
     OmegaConf.set_struct(base, strict)
-    override = OmegaConf.create(data)
+    override = OmegaConf.create(enum_decoded_data)
     return OmegaConf.to_object(OmegaConf.merge(base, override))
-
-
-def dataclass_to_dict(dataclass_instance: T) -> dict:
-    """
-    Converts a dataclass instance to a dictionary, recursively for nested structures.
-    """
-    if isinstance(dataclass_instance, dict):
-        return dataclass_instance
-
-    return OmegaConf.to_container(
-        OmegaConf.structured(dataclass_instance), resolve=True
-    )
 
 
 def load_config_file(config_file, dataclass_cls: Type[T]) -> T:
