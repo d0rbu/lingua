@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from omegaconf import OmegaConf
 from torch.nn import functional as F
+from torch.nn.attention.flex_attention import create_block_mask
 
 from apps.main.transformer import LMTransformer, LMTransformerArgs
 from lingua.args import dataclass_from_dict
@@ -120,8 +121,8 @@ class KVCache(nn.Module):
 
     def update(self, k_val, v_val, tok_idx):
         # input_pos: [B], k_val: [B, S, H, D]
-        self.k_cache.index_copy_(1, self.offset + tok_idx, k_val)
-        self.v_cache.index_copy_(1, self.offset + tok_idx, v_val)
+        self.k_cache.index_copy_(1, self.offset + tok_idx, k_val.to(self.k_cache.dtype))
+        self.v_cache.index_copy_(1, self.offset + tok_idx, v_val.to(self.v_cache.dtype))
         return self.k_cache, self.v_cache
 
 
@@ -255,7 +256,10 @@ class PackedCausalTransformerGenerator:
         #              e 11100000111000
         # We make sure to skip the empty cache positions
         # and only attend to positions within the same sequence
-        self.prefill_mask = self.model.create_block_mask(lengths, padded_lengths)
+        doc_mask_mod = generate_doc_mask_mod(causal_mask, lengths, padded_lengths)
+        self.prefill_mask = create_block_mask(
+            doc_mask_mod, 1, None, lengths.sum(), max_tokens
+        )
 
         # This creates the prefilling token ids which look like
         # the following for the packed sequence abcdefg1234
@@ -324,7 +328,7 @@ class PackedCausalTransformerGenerator:
     @torch.inference_mode()
     def generate(self: Self, prompts: List[str]):
         # Tokenize
-        tokenizer_has_bos = self.tokenizer.bos_token_id is not None
+        tokenizer_has_bos = self.tokenizer.bos_id is not None
         prompts = [
             self.tokenizer.encode(p, add_bos=tokenizer_has_bos, add_eos=False) for p in prompts
         ]
