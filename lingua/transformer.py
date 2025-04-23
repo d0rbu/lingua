@@ -518,6 +518,7 @@ class Attention(nn.Module):
         if hasattr(self, "kv_cache"):
             keys, values = self.kv_cache.update(keys, values, tok_idx)
 
+        queries = queries.to(keys.dtype)
         keys = self.repeat_kv(keys, self.heads_per_group, dim=2)
         values = self.repeat_kv(values, self.heads_per_group, dim=2)
 
