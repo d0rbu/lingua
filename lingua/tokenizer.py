@@ -173,6 +173,10 @@ class TikTokenTokenizer(Tokenizer):
         subs = []
         for i in range(0, len(text), TIKTOKEN_MAX_ENCODE_CHARS):
             subs.append(text[i : i + TIKTOKEN_MAX_ENCODE_CHARS])
+
+        assert not (add_bos and self.bos_id is None), "BOS token not defined"
+        assert not (add_eos and self.eos_id is None), "EOS token not defined"
+
         return (
             [self.bos_id] * add_bos
             + sum(self.tkt_model.encode_ordinary_batch(subs), start=[])

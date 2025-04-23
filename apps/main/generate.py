@@ -324,7 +324,7 @@ class PackedCausalTransformerGenerator:
     @torch.inference_mode()
     def generate(self: Self, prompts: List[str]):
         # Tokenize
-        tokenizer_has_bos = self.tokenizer.tokenizer.bos_token is not None
+        tokenizer_has_bos = self.tokenizer.bos_token_id is not None
         prompts = [
             self.tokenizer.encode(p, add_bos=tokenizer_has_bos, add_eos=False) for p in prompts
         ]
