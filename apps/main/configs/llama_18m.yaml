@@ -96,4 +96,4 @@ eval:
     max_steps: 1_000
   generator:
     max_tokens: 1024
-    dtype: bf16
+    dtype: fp32
