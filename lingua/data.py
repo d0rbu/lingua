@@ -429,6 +429,7 @@ def pack_tokens(
     n_views = empty_buffer_state["n_views"]
     start_token = empty_buffer_state["start_token"]
     previous_state = empty_buffer_state["it_state"]
+    pad_id = empty_buffer_state["pad_id"]
     buffer_size = output_seq_len + n_views - 1
     for tokens, state in iterator:
         end_token = start_token
@@ -450,6 +451,7 @@ def pack_tokens(
                     it_state=previous_state,
                     output_seq_len=output_seq_len,
                     n_views=n_views,
+                    pad_id=pad_id,
                 )
             )
             assert len(buffer) <= buffer_size, "Buffer overflow"
